@@ -1,19 +1,19 @@
+# app/main.py
 import os
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
+import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.middleware.cors import CORSMiddleware
-import openpyxl
 
 APP_TITLE = "Sierra Roofing Payroll Backend"
 app = FastAPI(title=APP_TITLE)
 
-# --- CORS (allow your Netlify site) ---
 FRONTEND_ORIGIN = os.getenv(
     "FRONTEND_ORIGIN",
-    "https://adorable-madeleine-291bb0.netlify.app"  # your current Netlify site
+    "https://adorable-madeleine-291bb0.netlify.app"  # update if Netlify domain changes
 )
 app.add_middleware(
     CORSMiddleware,
@@ -23,6 +23,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- helpers ----------
+NAME_ALIASES = {"name", "employee", "employee name", "worker", "employee_name"}
+HOURS_ALIASES = {"hours", "hrs", "total hours", "total_hrs", "time", "worked hours"}
+DATE_ALIASES = {"date", "day", "days", "work date", "workday", "work_date"}
+
+def find_col(df: pd.DataFrame, aliases: set[str]) -> str | None:
+    m = {c: str(c).strip().lower() for c in df.columns}
+    for orig, low in m.items():
+        if low in aliases:
+            return orig
+    for orig, low in m.items():
+        if any(a in low for a in aliases):
+            return orig
+    return None
+
+def to_last_first(name: str) -> str:
+    if not isinstance(name, str): return ""
+    n = name.strip()
+    if not n: return ""
+    if "," in n: return n
+    parts = n.split()
+    if len(parts) >= 2:
+        return f"{parts[-1]}, {' '.join(parts[:-1])}"
+    return n
+
+def sunday_for_week(d: date) -> date:
+    return d + timedelta(days=(6 - d.weekday()) % 7)
+
+def build_wbs_sheet(agg: pd.DataFrame, pe_date: date) -> BytesIO:
+    rpt_date = pe_date + timedelta(days=3)
+    ck_date  = pe_date + timedelta(days=5)
+
+    cols = [
+        "# V","DO NOT EDIT","Version = B90216-00","FmtRev = 2.1",
+        f"RunTime = {datetime.utcnow().strftime('%Y%m%d-%H%M%S')}",
+        "CliUnqId = 055269","CliName = Sierra Roofing and Solar Inc","Freq = W",
+        f"PEDate = {pe_date.strftime('%m/%d/%Y')}",
+        f"RptDate = {rpt_date.strftime('%m/%d/%Y')}",
+        f"CkDate = {ck_date.strftime('%m/%d/%Y')}",
+        "EmpType = SSN","DoNotes = 1","PayRates = H+;S+;E+;C+",
+        "RateCol = 6","T1 = 7+","CodeBeg = 8","CodeEnd = 26","NoteCol = 27",
+        "","","","","","","",""
+    ]
+
+    rows = []
+    rows.append(["# U","CliUnqID","055269"] + [None]*(len(cols)-3))
+    rows.append(["# N","Client","Sierra Roofing and Solar Inc"] + [None]*(len(cols)-3))
+    rows.append(["# P","Period End",pe_date.strftime("%m/%d/%Y")] + [None]*(len(cols)-3))
+    rows.append(["# R","Report Due",rpt_date.strftime("%m/%d/%Y")] + [None]*(len(cols)-3))
+    rows.append(["# C","Check Date",ck_date.strftime("%m/%d/%Y")] + [None]*(len(cols)-3))
+    rows.append(["# B:8"] + [None]*(len(cols)-1))
+    rows.append([
+        "# E:26","SSN","Employee Name","Status","Type","Pay Rate","Dept",
+        "REG (T1)","OT","DT","Code10","Code11","Code12","Code13","Code14",
+        "Code15","Code16","Code17","Code18","Code19","Code20","Code21","Code22",
+        "Code23","Code24","Code25","Code26","Notes"
+    ][:len(cols)])
+
+    for _, r in agg.sort_values("Employee Name").iterrows():
+        reg = float(r["Reg"]); ot = float(r["OT"])
+        row = [None]*len(cols)
+        row[0] = ""   # EmpID (unknown)
+        row[1] = ""   # SSN (can map later)
+        row[2] = r["Employee Name"]
+        row[3] = "A"  # Active
+        row[4] = "H"  # Hourly
+        row[5] = ""   # Pay rate (optional)
+        row[6] = "ROOF"
+        row[7] = reg
+        row[8] = ot
+        rows.append(row)
+
+    df_wbs = pd.DataFrame(rows, columns=cols[:len(rows[0])])
+
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df_wbs.to_excel(writer, index=False, sheet_name="WEEKLY")
+    out.seek(0)
+    return out
+
+# ---------- endpoints ----------
 @app.get("/")
 def root():
     return {"message": "Sierra Roofing Backend", "status": "running"}
@@ -31,9 +112,8 @@ def root():
 def health():
     return {"status": "healthy"}
 
-# Optional: stub so the Employees tab doesn't error
 @app.get("/employees")
-def list_employees():
+def employees_stub():
     return [
         {"name": "Sample Admin", "ssn": "0000", "department": "ADMIN", "pay_rate": 35.00},
         {"name": "Sample Roofer", "ssn": "1111", "department": "ROOF", "pay_rate": 28.50},
@@ -41,44 +121,58 @@ def list_employees():
 
 @app.post("/process-payroll")
 async def process_payroll(file: UploadFile = File(...)):
-    """
-    Accepts an uploaded Excel file (.xlsx), loads it, and returns
-    a valid Excel file back. For now this is a pass-through with
-    a small marker cell so we can verify end-to-end.
-    """
-    filename = file.filename or "input.xlsx"
-    if not filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=422, detail="Please upload an .xlsx Excel file.")
+    fname = (file.filename or "").lower()
+    if not fname.endswith((".xlsx",".xls")):
+        raise HTTPException(status_code=422, detail="Please upload an Excel file (.xlsx or .xls).")
 
     try:
-        data = await file.read()
-        wb = openpyxl.load_workbook(BytesIO(data))
-        # Add/mark a cell so we know it was processed by the backend
-        ws = wb.active
-        ws["A1"] = (ws["A1"].value or "Processed by Sierra Backend")
-        ws["B1"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        raw = await file.read()
+        df = pd.read_excel(BytesIO(raw), sheet_name=0)
 
-        out = BytesIO()
-        wb.save(out)
-        out.seek(0)
+        name_col = find_col(df, NAME_ALIASES)
+        hrs_col  = find_col(df, HOURS_ALIASES)
+        date_col = find_col(df, DATE_ALIASES)
 
-        out_name = f"WBS_Payroll_{datetime.utcnow().strftime('%Y-%m-%d')}.xlsx"
-        headers = {
-            "Content-Disposition": f'attachment; filename="{out_name}"'
-        }
+        if not name_col or not hrs_col:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Missing required columns (need Name & Hours). Found: {list(df.columns)}"
+            )
+
+        df = df[[name_col, hrs_col] + ([date_col] if date_col else [])].copy()
+        df = df[df[name_col].notna()]
+        df[hrs_col] = pd.to_numeric(df[hrs_col], errors="coerce").fillna(0.0)
+
+        if date_col:
+            dt = pd.to_datetime(df[date_col], errors="coerce")
+            valid = dt.dropna()
+            pe = sunday_for_week(valid.max().date()) if not valid.empty else sunday_for_week(date.today())
+        else:
+            pe = sunday_for_week(date.today())
+
+        agg = (
+            df.groupby(name_col, as_index=False)[hrs_col].sum()
+              .rename(columns={name_col: "Name", hrs_col: "TotalHours"})
+        )
+        agg["Employee Name"] = agg["Name"].apply(to_last_first)
+        agg["Reg"] = agg["TotalHours"].clip(upper=40)
+        agg["OT"]  = (agg["TotalHours"] - 40).clip(lower=0)
+
+        out = build_wbs_sheet(agg, pe)
+        out_name = f"WBS_Payroll_{pe.strftime('%Y-%m-%d')}.xlsx"
+        headers = {"Content-Disposition": f'attachment; filename=\"{out_name}\"'}
         return StreamingResponse(
             out,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers=headers,
         )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        # Log-friendly error response
-        return JSONResponse(
-            status_code=500,
-            content={"detail": f"Server error while processing Excel: {str(e)}"},
-        )
+        return JSONResponse(status_code=500, content={"detail": f"Server error: {str(e)}"})
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
