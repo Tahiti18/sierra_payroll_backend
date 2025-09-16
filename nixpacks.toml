@@ -1,8 +1,11 @@
+[phases.setup]
+nixPkgs = ["python39"]
+
+[phases.install]
+cmd = "pip install -r requirements.txt"
+
 [phases.build]
-cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
+cmd = "echo 'Build complete'"
 
-[phases.start]
+[start]
 cmd = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
-
-[variables]
-NIXPACKS_PYTHON_VERSION = "3.11"
