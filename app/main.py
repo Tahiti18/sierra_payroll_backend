@@ -130,16 +130,20 @@ def aggregate_hours(df: pd.DataFrame, name_col: str, hrs_col: str, date_col: Opt
     return totals, pe
 
 def build_wbs_weekly(roster: pd.DataFrame, agg: pd.DataFrame, pe_date: date) -> BytesIO:
-    out = roster.merge(agg, how="left", on="Employee Name", validate="1:1")
+    # Normalize names for safer merge
+roster = roster.copy()
+agg = agg.copy()
+roster["__norm"] = roster["Employee Name"].map(lambda n: str(n).strip().upper())
+agg["__norm"]    = agg["Employee Name"].map(lambda n: str(n).strip().upper())
 
-    # Missing names?
-    missing = agg.loc[agg["Employee Name"].isin(out[out["TotalHours"].isna()]["Employee Name"]), "Employee Name"].unique()
-    missing = [m for m in missing if pd.notna(m)]
-    if missing:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Employees missing from roster.csv: {sorted(set(missing))}"
-        )
+out = roster.merge(agg, how="left", on="__norm", validate="1:1")
+out.drop(columns="__norm", inplace=True)
+
+# Fill missing hours with 0 instead of failing
+for c in ["TotalHours","Reg","OT","DT","MON","TUE","WED","THU","FRI"]:
+    if c not in out.columns:
+        out[c] = 0.0
+    out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
 
     for c in ["TotalHours","Reg","OT","DT","MON","TUE","WED","THU","FRI"]:
         if c in out.columns:
