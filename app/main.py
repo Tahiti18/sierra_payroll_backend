@@ -2,6 +2,8 @@
 Sierra Roofing Payroll Backend
 FastAPI application entry point with all routing and middleware
 """
+import os
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -110,6 +112,15 @@ async def global_exception_handler(request, exc):
         }
     )
 
+# Railway deployment fix - proper PORT handling
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Get port from environment variable with fallback
+    port = int(os.environ.get("PORT", 8000))
+    
+    # Run the application
+    uvicorn.run(
+        "app.main:app",  # Updated to use proper module path
+        host="0.0.0.0",
+        port=port,
+        log_level="info"
+    )
