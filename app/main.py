@@ -320,22 +320,37 @@ async def process_payroll(file: UploadFile = File(...)):
                 detail=f"Missing required columns (need Name & Hours). Found: {list(df.columns)}"
             )
 
+        # 🔑 Aggregate hours
         agg, pe = aggregate_hours(df, name_col, hrs_col, date_col)
+
+        # 🔑 Load roster
         roster = load_roster()
+
+        # 🔑 Generate WBS file
         out_stream = build_wbs_weekly(roster, agg, pe)
 
         out_name = f"WBS_Payroll_{pe.strftime('%Y-%m-%d')}.xlsx"
-        headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+        headers = {"Content-Disposition": f'attachment; filename=\"{out_name}\"'}
+
         return StreamingResponse(
             out_stream,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers=headers,
         )
+
     except HTTPException:
         raise
     except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": f"Server error: {str(e)}"})
-
+    import traceback, logging
+    tb = traceback.format_exc()
+    logging.error("Payroll processing error: %s\n%s", e, tb)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": f"Server error: {type(e).__name__}: {str(e)}",
+            "traceback": tb.splitlines()
+        }
+    )
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
