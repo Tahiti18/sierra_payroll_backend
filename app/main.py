@@ -1,135 +1,189 @@
 # app/main.py
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
-from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
 from pathlib import Path
 import csv
 import openpyxl
-import os
+
+# ---- Try to import the real converter (must live at app/converter.py) ----
+# Expected callable signature: convert(sierra_bytes: bytes, roster_rows: list[dict]) -> bytes
+HAS_CONVERTER = False
+try:
+    from .converter import convert as convert_workbook  # type: ignore
+    HAS_CONVERTER = True
+except Exception:
+    HAS_CONVERTER = False
 
 app = FastAPI(title="Sierra Payroll Backend")
 
-# ---- CORS: allow your Netlify app (and OPTIONS preflight) ----
-NETLIFY_ORIGIN = os.getenv("NETLIFY_ORIGIN", "https://adorable-madeline-291bb0.netlify.app")
+# ---- CORS (allow your Netlify domain; add others if needed) ----
+FRONTEND_ORIGINS = [
+    "https://adorable-madeline-291bb0.netlify.app",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[NETLIFY_ORIGIN],
+    allow_origins=FRONTEND_ORIGINS + ["http://localhost", "http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- in-memory roster cache (loaded from CSV on first request) ----
-_ROSTER = None
-ROSTER_PATH = Path(__file__).parent / "data" / "roster.csv"
-
-def load_roster():
-    global _ROSTER
-    if _ROSTER is not None:
-        return _ROSTER
-
-    if not ROSTER_PATH.exists():
-        _ROSTER = []
-        return _ROSTER
-
-    rows = []
-    with ROSTER_PATH.open("r", newline="", encoding="utf-8-sig") as f:
-        rdr = csv.DictReader(f)
-        # Normalize fieldnames we actually use in the UI
-        for r in rdr:
-            rows.append({
-                "EmpID": (r.get("EmpID") or r.get("Emp Id") or r.get("EmpID " ) or "").strip(),
-                "SSN": (r.get("SSN") or r.get("Ssn") or "").strip(),
-                "EmployeeName": (r.get("Employee Name") or r.get("EmployeeName") or "").strip(),
-                "Status": (r.get("Status") or "").strip(),
-                "Type": (r.get("Type") or "").strip(),
-                "PayRate": (r.get("PayRate") or r.get("Pay Rate") or "").strip(),
-                "Dept": (r.get("Dept") or r.get("Department") or "").strip(),
-            })
-    _ROSTER = rows
-    return _ROSTER
-
-# ---------------- Health & Home ----------------
+# ---- Health check ----------------------------------------------------------
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return f"""
-    <h3>Sierra Payroll Backend is running.</h3>
-    <p>Allowed origin: <code>{NETLIFY_ORIGIN}</code></p>
-    <p>Try <code>/health</code> or <code>/employees</code>.</p>
-    """
+# ========================================================================== #
+#                                EMPLOYEES API                               #
+# ========================================================================== #
 
-# ---------------- Employees API ----------------
+ROSTER_PATH = (Path(__file__).parent / "data" / "roster.csv").resolve()
+
+REQUIRED_HEADERS = {
+    "empid": ["empid", "employee id", "id"],
+    "ssn": ["ssn", "social security", "social security number"],
+    "employee name": ["employee name", "name"],
+    "status": ["status"],
+    "type": ["type", "pay type"],
+    "payrate": ["payrate", "pay rate", "rate"],
+    "dept": ["dept", "department"],
+}
+
+def _map_headers(hdr_row: list[str]) -> dict:
+    idx = {}
+    low = [str(h or "").strip().lower() for h in hdr_row]
+    for want, alist in REQUIRED_HEADERS.items():
+        for a in alist:
+            if a in low:
+                idx[want] = low.index(a)
+                break
+    missing = [k for k in REQUIRED_HEADERS.keys() if k not in idx]
+    if missing:
+        raise ValueError(f"Roster missing columns: {', '.join(missing)}")
+    return idx
+
+def _load_roster() -> list[dict]:
+    if not ROSTER_PATH.exists():
+        raise FileNotFoundError(f"Roster not found at {ROSTER_PATH}")
+    rows: list[dict] = []
+    with ROSTER_PATH.open("r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        data = list(reader)
+    if not data:
+        return rows
+    hdr_map = _map_headers(data[0])
+    for r in data[1:]:
+        if not r or all((c or "").strip() == "" for c in r):
+            continue
+        def get(k: str) -> str:
+            i = hdr_map[k]
+            return (r[i] if i < len(r) else "").strip()
+        rows.append({
+            "EmpID": get("empid"),
+            "SSN": get("ssn"),
+            "EmployeeName": get("employee name"),
+            "Status": get("status"),
+            "Type": get("type"),
+            "PayRate": get("payrate"),
+            "Dept": get("dept"),
+        })
+    return rows
+
 @app.get("/employees")
 async def get_employees():
-    roster = load_roster()
-    return JSONResponse(roster)
+    try:
+        roster = _load_roster()
+        return JSONResponse({"count": len(roster), "employees": roster})
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read roster: {e}")
 
-@app.post("/employees")
-async def upsert_employee(emp: dict = Body(...)):
+# ========================================================================== #
+#                            PAYROLL CONVERSION API                           #
+# ========================================================================== #
+
+def _echo_back_if_needed(xlsx_bytes: bytes) -> bytes:
     """
-    Optional: lets the UI add/update an employee in-memory for this run.
-    Fields: EmpID, SSN, EmployeeName, Status, Type, PayRate, Dept
+    Safety: if converter module is missing, don't fake payroll;
+    raise a 501 so the UI shows a clear message.
     """
-    roster = load_roster()
-    key = (emp.get("SSN") or "").strip()
-    name = (emp.get("EmployeeName") or "").strip()
-    if not key and not name:
-        raise HTTPException(status_code=400, detail="Employee must have SSN or EmployeeName")
+    if not HAS_CONVERTER:
+        raise HTTPException(
+            status_code=501,
+            detail="Converter not installed on backend. Add app/converter.py with convert() "
+                   "or deploy the latest backend that includes the converter.",
+        )
+    return xlsx_bytes  # placeholder never used because we raise above
 
-    # match by SSN first, else by name
-    idx = None
-    for i, r in enumerate(roster):
-        if key and r.get("SSN") == key:
-            idx = i; break
-        if not key and name and r.get("EmployeeName") == name:
-            idx = i; break
+async def _convert_endpoint_logic(sierra_file: UploadFile, roster_file: UploadFile | None):
+    if not sierra_file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="Sierra file must be .xlsx")
 
-    normalized = {
-        "EmpID": (emp.get("EmpID") or "").strip(),
-        "SSN": key,
-        "EmployeeName": name,
-        "Status": (emp.get("Status") or "").strip(),
-        "Type": (emp.get("Type") or "").strip(),
-        "PayRate": (emp.get("PayRate") or "").strip(),
-        "Dept": (emp.get("Dept") or "").strip(),
-    }
-    if idx is None:
-        roster.append(normalized)
+    sierra_bytes = await sierra_file.read()
+
+    # Load roster from CSV by default
+    roster_rows = _load_roster()
+
+    # If a roster Excel was uploaded via UI, use it instead
+    if roster_file and roster_file.filename and roster_file.filename.lower().endswith((".xlsx", ".xls")):
+        try:
+            b = await roster_file.read()
+            wb = openpyxl.load_workbook(BytesIO(b), data_only=True)
+            sh = wb.active
+            hdr = [str(c.value or "").strip() for c in next(sh.iter_rows(min_row=1, max_row=1, values_only=False))]
+            idx = _map_headers(hdr)
+            roster_rows = []
+            for row in sh.iter_rows(min_row=2, values_only=True):
+                if not row or all((c or "") == "" for c in row):
+                    continue
+                def gv(k: str) -> str:
+                    i = idx[k]
+                    return str(row[i] or "").strip()
+                roster_rows.append({
+                    "EmpID": gv("empid"),
+                    "SSN": gv("ssn"),
+                    "EmployeeName": gv("employee name"),
+                    "Status": gv("status"),
+                    "Type": gv("type"),
+                    "PayRate": gv("payrate"),
+                    "Dept": gv("dept"),
+                })
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse uploaded roster workbook: {e}")
+
+    # Run real converter if installed
+    if HAS_CONVERTER:
+        try:
+            result_bytes = convert_workbook(sierra_bytes, roster_rows)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Converter error: {e}")
     else:
-        roster[idx] = normalized
-    return {"ok": True, "count": len(roster)}
+        # Clear message – DO NOT fake success
+        result_bytes = _echo_back_if_needed(sierra_bytes)  # will raise 501
 
-# ---------------- Convert API (pipe test for now) ----------------
+    filename_out = "WBS_Payroll.xlsx"
+    return StreamingResponse(
+        BytesIO(result_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename_out}"'},
+    )
+
 @app.post("/api/convert")
 async def convert_api(
     sierra_file: UploadFile = File(...),
     roster_file: UploadFile | None = File(None),
 ):
-    if not sierra_file.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Sierra file must be .xlsx")
+    return await _convert_endpoint_logic(sierra_file, roster_file)
 
-    try:
-        # If a roster file is supplied, we accept it (future: merge/update _ROSTER)
-        if roster_file and roster_file.filename.lower().endswith(".xlsx"):
-            # placeholder: just read to ensure it’s a valid xlsx
-            _ = await roster_file.read()
-
-        # Echo workbook back — confirms upload/download path is good.
-        data = await sierra_file.read()
-        wb = openpyxl.load_workbook(BytesIO(data), data_only=True)
-        bio = BytesIO()
-        wb.save(bio)
-        bio.seek(0)
-
-        return StreamingResponse(
-            bio,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": 'attachment; filename="WBS_Payroll.xlsx"'},
-        )
-    except Exception as e:
-        return PlainTextResponse(f"Failed to read Excel: {e}", status_code=400)
+# UI sometimes calls /process-payroll – make it an alias
+@app.post("/process-payroll")
+async def process_payroll(
+    sierra_file: UploadFile = File(...),
+    roster_file: UploadFile | None = File(None),
+):
+    return await _convert_endpoint_logic(sierra_file, roster_file)
