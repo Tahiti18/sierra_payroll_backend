@@ -14,11 +14,11 @@ app = FastAPI(title="Sierra Payroll Backend")
 # --- CORS: allow Netlify + localhost for testing ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://adorable-madeline-291bb0.netlify.app",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=["*"],   # TEMP: allow everything
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
