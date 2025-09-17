@@ -12,14 +12,11 @@ from starlette.responses import StreamingResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-# --------------------------------------------------------------------------------------
-# App
-# --------------------------------------------------------------------------------------
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="4.2.0")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your frontend domain later if needed
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,9 +24,7 @@ app.add_middleware(
 
 ALLOWED_EXTS = (".xlsx", ".xls")
 
-# --------------------------------------------------------------------------------------
-# Paths & file discovery (root/app/app/data/server + env override)
-# --------------------------------------------------------------------------------------
+# ---------- file discovery ----------
 BASE_DIR = Path(__file__).resolve().parents[1]
 SEARCH_DIRS = [BASE_DIR, BASE_DIR / "app", BASE_DIR / "app" / "data", BASE_DIR / "server"]
 
@@ -45,9 +40,7 @@ def _find_file(basenames: List[str]) -> Optional[Path]:
                 return p
     return None
 
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
+# ---------- helpers ----------
 def _ext_ok(name: str) -> bool:
     n = (name or "").lower()
     return any(n.endswith(e) for e in ALLOWED_EXTS)
@@ -111,9 +104,7 @@ def _require(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> Dict[str, str]:
     if miss: raise ValueError("Missing required columns: " + "; ".join(miss))
     return got
 
-# --------------------------------------------------------------------------------------
-# Roster & Template loaders
-# --------------------------------------------------------------------------------------
+# ---------- template & roster ----------
 def _load_template_from_disk() -> bytes:
     p = _find_file(["wbs_template.xlsx"])
     if not p:
@@ -150,9 +141,7 @@ def _load_roster_df() -> Optional[pd.DataFrame]:
     }).dropna(subset=["employee_key"]).drop_duplicates(subset=["employee_key"], keep="last")
     return out
 
-# --------------------------------------------------------------------------------------
-# Build weekly (ONE ROW PER EMPLOYEE)
-# --------------------------------------------------------------------------------------
+# ---------- build weekly one-row-per-employee ----------
 def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) -> pd.DataFrame:
     excel = pd.ExcelFile(io.BytesIO(xlsx_bytes))
     sheet = sheet_name or excel.sheet_names[0]
@@ -166,8 +155,7 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
     }
     optional = {
         "department": ["department","dept","division"],
-        # DO NOT read SSN from Sierra; it isn't there.
-        # "ssn": ["ssn","social","social security","social security number"],
+        # Sierra has no SSN
         "wtype": ["type","employee type","emp type","pay type"],
     }
 
@@ -179,9 +167,9 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
     typ_col = _find_col(df, optional["wtype"])
     core["department"] = df[dep_col] if dep_col else ""
     core["wtype"]      = df[typ_col] if typ_col else ""
-    core["ssn"]        = ""  # always blank; will be filled from roster
+    core["ssn"]        = ""  # filled later from roster
 
-    # Normalize & keys
+    # normalize
     core["employee"]   = core["employee"].astype(str).map(_normalize_name)
     core["emp_key"]    = core["employee"].map(_canon_name)
     core["date"]       = core["date"].map(_to_date)
@@ -194,48 +182,44 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
     if core.empty:
         raise ValueError("No valid rows found in Sierra sheet (need Employee, Date, Hours > 0, Rate).")
 
-    # 1) Sum hours per employee per day
+    # per-day totals
     per_day = core.groupby(["emp_key","employee","date"], dropna=False).agg({"hours":"sum"}).reset_index()
 
-    # 2) Daily CA OT/DT split
-    splits = []
+    # daily OT/DT split
+    parts = []
     for _, r in per_day.iterrows():
         d = _ca_daily_ot(float(r["hours"]))
-        splits.append({"emp_key": r["emp_key"], "employee": r["employee"], "date": r["date"], "REG": d["REG"], "OT": d["OT"], "DT": d["DT"]})
-    split_df = pd.DataFrame(splits)
+        parts.append({"emp_key": r["emp_key"], "employee": r["employee"], "date": r["date"], "REG": d["REG"], "OT": d["OT"], "DT": d["DT"]})
+    split_df = pd.DataFrame(parts)
 
-    # 3) Weekly totals per employee (one row each)
+    # weekly hours by employee
     weekly_hours = split_df.groupby(["emp_key","employee"], dropna=False)[["REG","OT","DT"]].sum().reset_index()
 
-    # 4) Dollars from raw records (handles mixed rates)
+    # dollars from raw with proportional split per day
     dollars = defaultdict(lambda: {"REG_$":0.0,"OT_$":0.0,"DT_$":0.0})
     day_totals = { (r["emp_key"], r["date"]): r for _, r in split_df.iterrows() }
 
     for _, rec in core.iterrows():
         key = (rec["emp_key"], rec["date"])
-        if key not in day_totals:
-            continue
+        if key not in day_totals: continue
         tot = day_totals[key]
         day_sum = tot["REG"] + tot["OT"] + tot["DT"]
-        if day_sum <= 0:
-            continue
-        portion = float(rec["hours"]) / day_sum
-        reg_share = tot["REG"] * portion
-        ot_share  = tot["OT"]  * portion
-        dt_share  = tot["DT"]  * portion
+        if day_sum <= 0: continue
+        portion  = float(rec["hours"]) / day_sum
+        reg_share, ot_share, dt_share = tot["REG"]*portion, tot["OT"]*portion, tot["DT"]*portion
         base = float(rec["rate"])
         dollars[rec["emp_key"]]["REG_$"] += reg_share * base
         dollars[rec["emp_key"]]["OT_$"]  += ot_share  * base * 1.5
         dollars[rec["emp_key"]]["DT_$"]  += dt_share  * base * 2.0
 
-    # 5) Display rate = most frequent weekly rate
+    # display rate = most frequent per employee
     chosen_rate, first_dept, first_type = {}, {}, {}
-    for emp_key, group in core.groupby("emp_key"):
-        rates = Counter([float(r) for r in group["rate"].tolist()])
-        chosen_rate[emp_key] = max(rates.items(), key=lambda kv: kv[1])[0]
-        first_dept[emp_key]  = group["department"].dropna().astype(str).replace("nan","").iloc[0] if not group.empty else ""
-        wtyp = str(group["wtype"].dropna().astype(str).replace("nan","").iloc[0] if not group.empty else "")
-        first_type[emp_key]  = "S" if wtyp.upper().startswith("S") else "H"
+    for k, g in core.groupby("emp_key"):
+        rates = Counter([float(r) for r in g["rate"].tolist()])
+        chosen_rate[k] = max(rates.items(), key=lambda kv: kv[1])[0]
+        first_dept[k]  = g["department"].dropna().astype(str).replace("nan","").iloc[0] if not g.empty else ""
+        wtyp = str(g["wtype"].dropna().astype(str).replace("nan","").iloc[0] if not g.empty else "")
+        first_type[k]  = "S" if wtyp.upper().startswith("S") else "H"
 
     weekly = weekly_hours.copy()
     weekly["REG_$"]   = weekly["emp_key"].map(lambda k: round(_money(dollars[k]["REG_$"]), 2))
@@ -257,12 +241,11 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
         "REG","OT","DT","REG_$","OT_$","DT_$","TOTAL_$"
     ]].copy()
 
-    # Apply roster defaults by canonical key
+    # merge roster by canonical key
     roster = _load_roster_df()
     weekly, missing = _apply_roster_defaults_by_key(weekly, roster)
     if missing:
         raise ValueError("Missing SSN in roster for: " + ", ".join(missing))
-
     return weekly
 
 def _apply_roster_defaults_by_key(weekly_df: pd.DataFrame, roster: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, List[str]]:
@@ -275,12 +258,7 @@ def _apply_roster_defaults_by_key(weekly_df: pd.DataFrame, roster: Optional[pd.D
         left_on="emp_key", right_on="employee_key", how="left"
     )
 
-    # SSN only from roster (Sierra had none)
-    merged["ssn"] = merged.apply(
-        lambda r: r["ssn_y"] if str(r["ssn_y"]).strip() not in ("", "nan", "None") else "", axis=1
-    )
-
-    # Department / Type
+    merged["ssn"] = merged.apply(lambda r: r["ssn_y"] if str(r["ssn_y"]).strip() not in ("", "nan", "None") else "", axis=1)
     merged["department"] = merged.apply(
         lambda r: r["department"] if str(r["department"]).strip() not in ("", "nan", "None")
         else (r["department_roster"] if pd.notna(r["department_roster"]) else ""), axis=1
@@ -289,24 +267,19 @@ def _apply_roster_defaults_by_key(weekly_df: pd.DataFrame, roster: Optional[pd.D
         lambda r: r["Type"] if str(r["Type"]).strip() not in ("", "nan", "None")
         else ("S" if str(r.get("wtype_roster","")).upper().startswith("S") else "H"), axis=1
     )
-
-    # Rate: keep computed; if 0 and roster has a default, use it
     merged["rate"] = merged.apply(
         lambda r: r["rate"] if float(r["rate"] or 0) > 0
         else (float(r["rate_roster"]) if pd.notna(r["rate_roster"]) else 0.0), axis=1
     )
 
-    missing = sorted(merged.loc[merged["ssn"].astype(str).isin(["", "nan", "None"]), "employee"].unique().tolist())
-
+    missing = sorted(merged.loc[merged["ssn"].astype(str).isin(["", "nan", "None", ""]) , "employee"].unique().tolist())
     final = merged[[
         "employee","ssn","Status","Type","rate","department",
         "REG","OT","DT","REG_$","OT_$","DT_$","TOTAL_$"
     ]].copy()
     return final, missing
 
-# --------------------------------------------------------------------------------------
-# Template write
-# --------------------------------------------------------------------------------------
+# ---------- template write ----------
 def _find_wbs_header(ws: Worksheet) -> Tuple[int, Dict[str, int]]:
     targets = ["ssn","employee name","status","type","pay rate","dept","a01","a02","a03"]
     for r in range(1, ws.max_row+1):
@@ -337,7 +310,7 @@ def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> byte
     header_row, cols = _find_wbs_header(ws)
     first_data_row = header_row + 1
 
-    # clear existing data rows
+    # clear old data
     scan_col = cols.get("name") or cols.get("ssn") or 2
     last = ws.max_row
     last_data = first_data_row - 1
@@ -347,7 +320,7 @@ def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> byte
     if last_data >= first_data_row:
         ws.delete_rows(first_data_row, last_data - first_data_row + 1)
 
-    # append weekly rows
+    # rows
     for _, row in weekly.iterrows():
         values = [""] * max(ws.max_column, 16)
         if cols.get("ssn")    : values[cols["ssn"]-1]    = row["ssn"]
@@ -365,8 +338,8 @@ def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> byte
         if cols.get("total$") : values[cols["total$"]-1] = row["TOTAL_$"]
         ws.append(values)
 
-    # spacer + TOTAL row
-    ws.append([])  # blank row
+    # spacer + TOTAL
+    ws.append([])
     totals = {
         "REG": float(weekly["REG"].sum()),
         "OT":  float(weekly["OT"].sum()),
@@ -391,9 +364,7 @@ def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> byte
     wb.save(bio); bio.seek(0)
     return bio.read()
 
-# --------------------------------------------------------------------------------------
-# Routes
-# --------------------------------------------------------------------------------------
+# ---------- routes ----------
 @app.get("/health")
 def health():
     return JSONResponse({"ok": True, "ts": datetime.utcnow().isoformat() + "Z"})
@@ -412,6 +383,18 @@ def roster_status():
     if r is None:
         return JSONResponse({"roster":"missing"})
     return JSONResponse({"roster":"found","employees":int(r.drop_duplicates('employee_key').shape[0])})
+
+# Debug endpoint to test name matching quickly
+@app.get("/debug/lookup")
+def debug_lookup(name: str):
+    key = _canon_name(name)
+    roster = _load_roster_df()
+    if roster is None:
+        return {"error": "roster missing"}
+    matches = roster.loc[roster["employee_key"] == key]
+    if matches.empty:
+        return {"name": name, "canon_key": key, "match": False}
+    return {"name": name, "canon_key": key, "match": True, "roster_entry": matches.iloc[0].to_dict()}
 
 @app.post("/process-payroll")
 async def process_payroll(file: UploadFile = File(..., description="Sierra payroll .xlsx")):
