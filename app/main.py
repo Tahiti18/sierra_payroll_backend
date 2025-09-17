@@ -12,7 +12,7 @@ from starlette.responses import StreamingResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="4.3.0")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="4.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ app.add_middleware(
 
 ALLOWED_EXTS = (".xlsx", ".xls")
 
-# ---------- file discovery ----------
+# ---------------- file discovery ----------------
 BASE_DIR = Path(__file__).resolve().parents[1]
 SEARCH_DIRS = [BASE_DIR, BASE_DIR / "app", BASE_DIR / "app" / "data", BASE_DIR / "server"]
 
@@ -40,7 +40,7 @@ def _find_file(basenames: List[str]) -> Optional[Path]:
                 return p
     return None
 
-# ---------- helpers ----------
+# ---------------- helpers ----------------
 def _ext_ok(name: str) -> bool:
     n = (name or "").lower()
     return any(n.endswith(e) for e in ALLOWED_EXTS)
@@ -74,13 +74,6 @@ def _to_date(v) -> Optional[date]:
     except Exception:
         return None
 
-def _ca_daily_ot(h: float) -> Dict[str, float]:
-    h = float(h or 0.0)
-    reg = min(h, 8.0)
-    ot  = min(max(h-8.0, 0.0), 4.0)
-    dt  = max(h-12.0, 0.0)
-    return {"REG": reg, "OT": ot, "DT": dt}
-
 def _money(x: float) -> float:
     return float(x or 0.0)
 
@@ -95,16 +88,7 @@ def _find_col(df: pd.DataFrame, options: List[str]) -> Optional[str]:
             if w in k: return c
     return None
 
-def _require(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> Dict[str, str]:
-    got, miss = {}, []
-    for key, opts in mapping.items():
-        c = _find_col(df, opts)
-        if not c: miss.append(f"{key} (any of: {', '.join(opts)})")
-        else: got[key] = c
-    if miss: raise ValueError("Missing required columns: " + "; ".join(miss))
-    return got
-
-# ---------- template & roster ----------
+# ---------------- roster & template loaders ----------------
 def _load_template_from_disk() -> bytes:
     p = _find_file(["wbs_template.xlsx"])
     if not p:
@@ -141,35 +125,102 @@ def _load_roster_df() -> Optional[pd.DataFrame]:
     }).dropna(subset=["employee_key"]).drop_duplicates(subset=["employee_key"], keep="last")
     return out
 
-# ---------- build weekly one-row-per-employee ----------
+# ---------------- smart column guessing for Sierra ----------------
+COMMON_EMP = ["employee","employee name","name","worker","employee_name"]
+COMMON_DATE= ["date","work date","day","worked date","check date","report date"]
+COMMON_HRS = ["hours","hrs","total hours","work hours","a01","regular","reg"]
+COMMON_RATE= ["rate","pay rate","hourly rate","wage","base rate"]
+
+def _guess_employee_col(df: pd.DataFrame) -> Optional[str]:
+    c = _find_col(df, COMMON_EMP)
+    if c: return c
+    # Heuristic: string column with many commas (Last, First)
+    best, score = None, -1
+    for col in df.columns:
+        s = df[col].astype(str)
+        # score by % rows that look like names (letters + comma)
+        looks = s.str.contains(r"[A-Za-z],\s*[A-Za-z]", regex=True, na=False)
+        sc = looks.mean()
+        if sc > score:
+            score, best = sc, col
+    return best if score >= 0.2 else None
+
+def _guess_date_col(df: pd.DataFrame) -> Optional[str]:
+    c = _find_col(df, COMMON_DATE)
+    if c: return c
+    # Heuristic: datetime-like or parseable with many successes
+    best, score = None, -1
+    for col in df.columns:
+        s = df[col]
+        try:
+            parsed = pd.to_datetime(s, errors="coerce")
+            sc = parsed.notna().mean()
+            if sc > score:
+                score, best = sc, col
+        except Exception:
+            continue
+    return best if score >= 0.3 else None
+
+def _guess_hours_col(df: pd.DataFrame) -> Optional[str]:
+    c = _find_col(df, COMMON_HRS)
+    if c: return c
+    best, score = None, -1
+    for col in df.columns:
+        try:
+            v = pd.to_numeric(df[col], errors="coerce")
+        except Exception:
+            continue
+        # hours should be mostly between 0 and 24 and non-integers sometimes
+        ok = v.between(0, 24, inclusive="both").mean()
+        nz = (v > 0).mean()
+        sc = ok * 0.6 + nz * 0.4
+        if sc > score:
+            score, best = sc, col
+    return best if score >= 0.3 else None
+
+def _guess_rate_col(df: pd.DataFrame) -> Optional[str]:
+    c = _find_col(df, COMMON_RATE)
+    if c: return c
+    best, score = None, -1
+    for col in df.columns:
+        try:
+            v = pd.to_numeric(df[col], errors="coerce")
+        except Exception:
+            continue
+        # hourly rates typically 10–150; allow some salary-like outliers
+        ok = v.between(10, 150, inclusive="both").mean()
+        nonzero = (v > 0).mean()
+        sc = ok * 0.7 + nonzero * 0.3
+        if sc > score:
+            score, best = sc, col
+    return best if score >= 0.2 else None
+
+# ---------------- build weekly (one row per employee) ----------------
 def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) -> pd.DataFrame:
     excel = pd.ExcelFile(io.BytesIO(xlsx_bytes))
     sheet = sheet_name or excel.sheet_names[0]
     df = excel.parse(sheet)
 
-    required = {
-        "employee": ["employee","employee name","name","worker","employee_name"],
-        "date":     ["date","work date","day","worked date"],
-        "hours":    ["hours","hrs","total hours","work hours"],
-        "rate":     ["rate","pay rate","hourly rate","wage"],
-    }
-    optional = {
-        "department": ["department","dept","division"],
-        # Sierra has no SSN
-        "wtype": ["type","employee type","emp type","pay type"],
-    }
+    emp_col  = _guess_employee_col(df)
+    date_col = _guess_date_col(df)
+    hrs_col  = _guess_hours_col(df)
+    rate_col = _guess_rate_col(df)
 
-    got = _require(df, required)
-    core = df[[got["employee"], got["date"], got["hours"], got["rate"]]].copy()
+    missing = [k for k,v in {"employee":emp_col,"date":date_col,"hours":hrs_col,"rate":rate_col}.items() if not v]
+    if missing:
+        raise ValueError(f"Sierra header detection failed; missing: {', '.join(missing)}")
+
+    core = df[[emp_col, date_col, hrs_col, rate_col]].copy()
     core.columns = ["employee","date","hours","rate"]
 
-    dep_col = _find_col(df, optional["department"])
-    typ_col = _find_col(df, optional["wtype"])
+    # Optional department / type if present
+    dep_col = _find_col(df, ["department","dept","division"])
+    typ_col = _find_col(df, ["type","employee type","emp type","pay type"])
     core["department"] = df[dep_col] if dep_col else ""
     core["wtype"]      = df[typ_col] if typ_col else ""
-    core["ssn"]        = ""  # filled later from roster
+    core["ssn"]        = ""  # Sierra has no SSN; will be filled from roster
 
-    # normalize
+    # Normalize & filter
     core["employee"]   = core["employee"].astype(str).map(_normalize_name)
     core["emp_key"]    = core["employee"].map(_canon_name)
     core["date"]       = core["date"].map(_to_date)
@@ -182,40 +233,41 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
     if core.empty:
         raise ValueError("No valid rows found in Sierra sheet (need Employee, Date, Hours > 0, Rate).")
 
-    # per-day totals
+    # 1) sum hours per employee per day
     per_day = core.groupby(["emp_key","employee","date"], dropna=False).agg({"hours":"sum"}).reset_index()
 
-    # daily OT/DT split
-    parts = []
-    for _, r in per_day.iterrows():
-        d = _ca_daily_ot(float(r["hours"]))
-        parts.append({"emp_key": r["emp_key"], "employee": r["employee"], "date": r["date"], "REG": d["REG"], "OT": d["OT"], "DT": d["DT"]})
+    # 2) CA daily OT/DT
+    def split_ot_dt(h: float) -> Dict[str,float]:
+        h = float(h or 0.0)
+        reg = min(h, 8.0); ot = min(max(h-8.0, 0.0), 4.0); dt = max(h-12.0, 0.0)
+        return {"REG": reg, "OT": ot, "DT": dt}
+    parts = [{"emp_key":r.emp_key,"employee":r.employee,"date":r.date, **split_ot_dt(r.hours)}
+             for r in per_day.itertuples(index=False)]
     split_df = pd.DataFrame(parts)
 
-    # weekly hours by employee
+    # 3) weekly hours by employee
     weekly_hours = split_df.groupby(["emp_key","employee"], dropna=False)[["REG","OT","DT"]].sum().reset_index()
 
-    # dollars from raw with proportional split per day
+    # 4) dollars proportional by day/rate
     dollars = defaultdict(lambda: {"REG_$":0.0,"OT_$":0.0,"DT_$":0.0})
-    day_totals = { (r["emp_key"], r["date"]): r for _, r in split_df.iterrows() }
+    day_totals = { (r.emp_key, r.date): r for r in split_df.itertuples(index=False) }
 
-    for _, rec in core.iterrows():
-        key = (rec["emp_key"], rec["date"])
+    for r in core.itertuples(index=False):
+        key = (r.emp_key, r.date)
         if key not in day_totals: continue
         tot = day_totals[key]
-        day_sum = tot["REG"] + tot["OT"] + tot["DT"]
+        day_sum = tot.REG + tot.OT + tot.DT
         if day_sum <= 0: continue
-        portion  = float(rec["hours"]) / day_sum
-        reg_share, ot_share, dt_share = tot["REG"]*portion, tot["OT"]*portion, tot["DT"]*portion
-        base = float(rec["rate"])
-        dollars[rec["emp_key"]]["REG_$"] += reg_share * base
-        dollars[rec["emp_key"]]["OT_$"]  += ot_share  * base * 1.5
-        dollars[rec["emp_key"]]["DT_$"]  += dt_share  * base * 2.0
+        portion = float(r.hours) / day_sum
+        base = float(r.rate)
+        dollars[r.emp_key]["REG_$"] += tot.REG * portion * base
+        dollars[r.emp_key]["OT_$"]  += tot.OT  * portion * base * 1.5
+        dollars[r.emp_key]["DT_$"]  += tot.DT  * portion * base * 2.0
 
-    # display rate = most frequent per employee
+    # 5) chosen display rate/type/dept
     chosen_rate, first_dept, first_type = {}, {}, {}
-    for k, g in core.groupby("emp_key"):
-        rates = Counter([float(r) for r in g["rate"].tolist()])
+    for k,g in core.groupby("emp_key"):
+        rates = Counter([float(x) for x in g["rate"].tolist()])
         chosen_rate[k] = max(rates.items(), key=lambda kv: kv[1])[0]
         first_dept[k]  = g["department"].dropna().astype(str).replace("nan","").iloc[0] if not g.empty else ""
         wtyp = str(g["wtype"].dropna().astype(str).replace("nan","").iloc[0] if not g.empty else "")
@@ -229,7 +281,7 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
 
     weekly["rate"]       = weekly["emp_key"].map(lambda k: round(_money(chosen_rate.get(k, 0.0)), 2))
     weekly["department"] = weekly["emp_key"].map(lambda k: first_dept.get(k, ""))
-    weekly["ssn"]        = ""  # will be filled from roster
+    weekly["ssn"]        = ""  # roster will fill
     weekly["Status"]     = "A"
     weekly["Type"]       = weekly["emp_key"].map(lambda k: first_type.get(k, "H"))
 
@@ -279,7 +331,7 @@ def _apply_roster_defaults_by_key(weekly_df: pd.DataFrame, roster: Optional[pd.D
     ]].copy()
     return final, missing
 
-# ---------- template write ----------
+# ---------------- template write ----------------
 def _find_wbs_header(ws: Worksheet) -> Tuple[int, Dict[str, int]]:
     targets = ["ssn","employee name","status","type","pay rate","dept","a01","a02","a03"]
     for r in range(1, ws.max_row+1):
@@ -364,7 +416,7 @@ def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> byte
     wb.save(bio); bio.seek(0)
     return bio.read()
 
-# ---------- routes ----------
+# ---------------- routes ----------------
 @app.get("/health")
 def health():
     return JSONResponse({"ok": True, "ts": datetime.utcnow().isoformat() + "Z"})
@@ -384,7 +436,7 @@ def roster_status():
         return JSONResponse({"roster":"missing"})
     return JSONResponse({"roster":"found","employees":int(r.drop_duplicates('employee_key').shape[0])})
 
-# Debug endpoint to test name matching quickly
+# (Optional) check matching for a specific name
 @app.get("/debug/lookup")
 def debug_lookup(name: str):
     key = _canon_name(name)
