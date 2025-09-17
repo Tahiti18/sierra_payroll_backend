@@ -10,7 +10,7 @@ app = FastAPI(title="Sierra Payroll Backend")
 # --- CORS: wide-open while we stabilize; we can lock it later to your Netlify origin ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # later we can change to ["https://<your-netlify>.netlify.app"]
+    allow_origins=["https://adorable-madeline-291bb0.netlify.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
