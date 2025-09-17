@@ -12,11 +12,11 @@ from starlette.responses import StreamingResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="5.0.0")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="4.5.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten later to your frontend domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -41,43 +41,29 @@ def _find_file(basenames: List[str]) -> Optional[Path]:
     return None
 
 # ---------------- helpers ----------------
-def _std(s: str) -> str:
-    return (s or "").strip().lower().replace("\n"," ").replace("\r"," ")
-
 def _ext_ok(name: str) -> bool:
     n = (name or "").lower()
     return any(n.endswith(e) for e in ALLOWED_EXTS)
 
-def _clean_space(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s).strip()).replace(" ,", ",").replace(", ", ",")
+def _std(s: str) -> str:
+    return (s or "").strip().lower().replace("\n"," ").replace("\r"," ")
 
-def _name_parts(name: str):
-    """Return (last, first[full]) for either 'Last, First ...' or 'First ... Last'."""
-    name = _clean_space(name)
-    if "," in name:
-        last, first = name.split(",", 1)
-        return last.strip(), first.strip()
-    parts = name.split(" ")
-    if len(parts) >= 2:
-        last = parts[-1].strip()
-        first = " ".join(parts[:-1]).strip()
-        return last, first
-    return name.strip(), ""
-
-def _key_last_first(last: str, first: str) -> str:
-    return f"{last},{first}".lower()
-
-def _key_first_last(first: str, last: str) -> str:
-    return f"{first} {last}".lower()
-
-def _key_last_finit(last: str, first: str) -> str:
-    return f"{last},{(first[:1] or '').upper()}".lower()
+def _normalize_name(raw: str) -> str:
+    if not raw or not isinstance(raw, str): return ""
+    parts = [p for p in raw.strip().split() if p]
+    if len(parts) == 2:
+        return f"{parts[1]}, {parts[0]}"  # "First Last" -> "Last, First"
+    return raw.strip()
 
 def _canon_name(s: str) -> str:
-    s = _clean_space(s)
+    """Case-insensitive, accent-free, single-space, normalized comma key."""
+    if not isinstance(s, str):
+        s = str(s or "")
+    s = s.strip()
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.replace(".", "")
+    s = re.sub(r"\s+", " ", s)
     s = re.sub(r"\s*,\s*", ",", s)
     return s.lower()
 
@@ -102,7 +88,7 @@ def _find_col(df: pd.DataFrame, options: List[str]) -> Optional[str]:
             if w in k: return c
     return None
 
-# ---------------- template & roster loaders ----------------
+# ---------------- roster & template loaders ----------------
 def _load_template_from_disk() -> bytes:
     p = _find_file(["wbs_template.xlsx"])
     if not p:
@@ -126,27 +112,17 @@ def _load_roster_df() -> Optional[pd.DataFrame]:
     dept_col = _find_col(df, ["dept","department","division"])
     type_col = _find_col(df, ["type","employee type","emp type"])
 
-    if not name_col:
+    if not name_col or not ssn_col:
         return None
 
     out = pd.DataFrame({
-        "employee_disp": df[name_col].astype(str).map(_clean_space),
+        "employee_disp": df[name_col].astype(str).map(str.strip),
         "employee_key":  df[name_col].astype(str).map(_canon_name),
-        "ssn":           (df[ssn_col].astype(str).map(str.strip) if ssn_col else pd.Series([""]*len(df))),
+        "ssn":           df[ssn_col].astype(str).map(str.strip),
         "rate_roster":   pd.to_numeric(df[rate_col], errors="coerce") if rate_col else pd.Series([None]*len(df)),
         "department_roster": df[dept_col].astype(str).map(str.strip) if dept_col else pd.Series([""]*len(df)),
         "wtype_roster":      df[type_col].astype(str).map(str.strip) if type_col else pd.Series([""]*len(df)),
-    })
-
-    # variant keys for robust matching
-    last_first = out["employee_disp"].map(lambda s: _key_last_first(*_name_parts(s)))
-    first_last = out["employee_disp"].map(lambda s: _key_first_last(*_name_parts(s)[::-1]))
-    last_finit = out["employee_disp"].map(lambda s: _key_last_finit(*_name_parts(s)))
-    out["k_lf"]  = last_first
-    out["k_fl"]  = first_last
-    out["k_lfi"] = last_finit
-
-    out = out.dropna(subset=["employee_key"]).drop_duplicates(subset=["employee_key"], keep="last")
+    }).dropna(subset=["employee_key"]).drop_duplicates(subset=["employee_key"], keep="last")
     return out
 
 # ---------------- smart column guessing for Sierra ----------------
@@ -158,17 +134,21 @@ COMMON_RATE= ["rate","pay rate","hourly rate","wage","base rate"]
 def _guess_employee_col(df: pd.DataFrame) -> Optional[str]:
     c = _find_col(df, COMMON_EMP)
     if c: return c
+    # Heuristic: string column with many commas (Last, First)
     best, score = None, -1
     for col in df.columns:
         s = df[col].astype(str)
-        looks = s.str.contains(r"[A-Za-z],\s*[A-Za-z]", regex=True, na=False).mean()
-        if looks > score:
-            best, score = c ol, looks
+        # score by % rows that look like names (letters + comma)
+        looks = s.str.contains(r"[A-Za-z],\s*[A-Za-z]", regex=True, na=False)
+        sc = looks.mean()
+        if sc > score:
+            score, best = sc, col
     return best if score >= 0.2 else None
 
 def _guess_date_col(df: pd.DataFrame) -> Optional[str]:
     c = _find_col(df, COMMON_DATE)
     if c: return c
+    # Heuristic: datetime-like or parseable with many successes
     best, score = None, -1
     for col in df.columns:
         s = df[col]
@@ -190,6 +170,7 @@ def _guess_hours_col(df: pd.DataFrame) -> Optional[str]:
             v = pd.to_numeric(df[col], errors="coerce")
         except Exception:
             continue
+        # hours should be mostly between 0 and 24 and non-integers sometimes
         ok = v.between(0, 24, inclusive="both").mean()
         nz = (v > 0).mean()
         sc = ok * 0.6 + nz * 0.4
@@ -206,19 +187,15 @@ def _guess_rate_col(df: pd.DataFrame) -> Optional[str]:
             v = pd.to_numeric(df[col], errors="coerce")
         except Exception:
             continue
+        # hourly rates typically 10–150; allow some salary-like outliers
         ok = v.between(10, 150, inclusive="both").mean()
         nonzero = (v > 0).mean()
         sc = ok * 0.7 + nonzero * 0.3
         if sc > score:
-            best, score = sc, col
+            score, best = sc, col
     return best if score >= 0.2 else None
 
 # ---------------- build weekly (one row per employee) ----------------
-def _ca_daily_ot(h: float) -> Dict[str, float]:
-    h = float(h or 0.0)
-    reg = min(h, 8.0); ot = min(max(h-8.0, 0.0), 4.0); dt = max(h-12.0, 0.0)
-    return {"REG": reg, "OT": ot, "DT": dt}
-
 def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) -> pd.DataFrame:
     excel = pd.ExcelFile(io.BytesIO(xlsx_bytes))
     sheet = sheet_name or excel.sheet_names[0]
@@ -228,6 +205,7 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
     date_col = _guess_date_col(df)
     hrs_col  = _guess_hours_col(df)
     rate_col = _guess_rate_col(df)
+
     missing = [k for k,v in {"employee":emp_col,"date":date_col,"hours":hrs_col,"rate":rate_col}.items() if not v]
     if missing:
         raise ValueError(f"Sierra header detection failed; missing: {', '.join(missing)}")
@@ -235,14 +213,15 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
     core = df[[emp_col, date_col, hrs_col, rate_col]].copy()
     core.columns = ["employee","date","hours","rate"]
 
+    # Optional department / type if present
     dep_col = _find_col(df, ["department","dept","division"])
     typ_col = _find_col(df, ["type","employee type","emp type","pay type"])
     core["department"] = df[dep_col] if dep_col else ""
     core["wtype"]      = df[typ_col] if typ_col else ""
-    core["ssn"]        = ""  # SSN always comes from roster; never required here
+    core["ssn"]        = ""  # Sierra has no SSN; will be filled from roster
 
-    # normalize & filter
-    core["employee"]   = core["employee"].astype(str).map(_clean_space)
+    # Normalize & filter
+    core["employee"]   = core["employee"].astype(str).map(_normalize_name)
     core["emp_key"]    = core["employee"].map(_canon_name)
     core["date"]       = core["date"].map(_to_date)
     core["hours"]      = pd.to_numeric(core["hours"], errors="coerce").fillna(0.0).astype(float)
@@ -254,14 +233,16 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
     if core.empty:
         raise ValueError("No valid rows found in Sierra sheet (need Employee, Date, Hours > 0, Rate).")
 
-    # 1) per-day totals
+    # 1) sum hours per employee per day
     per_day = core.groupby(["emp_key","employee","date"], dropna=False).agg({"hours":"sum"}).reset_index()
 
-    # 2) daily OT/DT split
-    parts = []
-    for _, r in per_day.iterrows():
-        d = _ca_daily_ot(float(r["hours"]))
-        parts.append({"emp_key": r["emp_key"], "employee": r["employee"], "date": r["date"], "REG": d["REG"], "OT": d["OT"], "DT": d["DT"]})
+    # 2) CA daily OT/DT
+    def split_ot_dt(h: float) -> Dict[str,float]:
+        h = float(h or 0.0)
+        reg = min(h, 8.0); ot = min(max(h-8.0, 0.0), 4.0); dt = max(h-12.0, 0.0)
+        return {"REG": reg, "OT": ot, "DT": dt}
+    parts = [{"emp_key":r.emp_key,"employee":r.employee,"date":r.date, **split_ot_dt(r.hours)}
+             for r in per_day.itertuples(index=False)]
     split_df = pd.DataFrame(parts)
 
     # 3) weekly hours by employee
@@ -269,24 +250,24 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
 
     # 4) dollars proportional by day/rate
     dollars = defaultdict(lambda: {"REG_$":0.0,"OT_$":0.0,"DT_$":0.0})
-    day_totals = { (r["emp_key"], r["date"]): r for _, r in split_df.iterrows() }
+    day_totals = { (r.emp_key, r.date): r for r in split_df.itertuples(index=False) }
 
-    for _, rec in core.iterrows():
-        key = (rec["emp_key"], rec["date"])
+    for r in core.itertuples(index=False):
+        key = (r.emp_key, r.date)
         if key not in day_totals: continue
         tot = day_totals[key]
-        day_sum = tot["REG"] + tot["OT"] + tot["DT"]
+        day_sum = tot.REG + tot.OT + tot.DT
         if day_sum <= 0: continue
-        portion = float(rec["hours"]) / day_sum
-        base = float(rec["rate"])
-        dollars[rec["emp_key"]]["REG_$"] += tot["REG"] * portion * base
-        dollars[rec["emp_key"]]["OT_$"]  += tot["OT"]  * portion * base * 1.5
-        dollars[rec["emp_key"]]["DT_$"]  += tot["DT"]  * portion * base * 2.0
+        portion = float(r.hours) / day_sum
+        base = float(r.rate)
+        dollars[r.emp_key]["REG_$"] += tot.REG * portion * base
+        dollars[r.emp_key]["OT_$"]  += tot.OT  * portion * base * 1.5
+        dollars[r.emp_key]["DT_$"]  += tot.DT  * portion * base * 2.0
 
     # 5) chosen display rate/type/dept
     chosen_rate, first_dept, first_type = {}, {}, {}
     for k,g in core.groupby("emp_key"):
-        rates = Counter([float(r) for r in g["rate"].tolist()])
+        rates = Counter([float(x) for x in g["rate"].tolist()])
         chosen_rate[k] = max(rates.items(), key=lambda kv: kv[1])[0]
         first_dept[k]  = g["department"].dropna().astype(str).replace("nan","").iloc[0] if not g.empty else ""
         wtyp = str(g["wtype"].dropna().astype(str).replace("nan","").iloc[0] if not g.empty else "")
@@ -300,7 +281,7 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
 
     weekly["rate"]       = weekly["emp_key"].map(lambda k: round(_money(chosen_rate.get(k, 0.0)), 2))
     weekly["department"] = weekly["emp_key"].map(lambda k: first_dept.get(k, ""))
-    weekly["ssn"]        = ""  # will be filled from roster if available
+    weekly["ssn"]        = ""  # roster will fill
     weekly["Status"]     = "A"
     weekly["Type"]       = weekly["emp_key"].map(lambda k: first_type.get(k, "H"))
 
@@ -312,53 +293,39 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
         "REG","OT","DT","REG_$","OT_$","DT_$","TOTAL_$"
     ]].copy()
 
-    # Merge roster by robust keys (LF, FL, L+FI). Never raise on missing SSN.
+    # merge roster by canonical key
     roster = _load_roster_df()
-    weekly, _ = _apply_roster_defaults_by_key(weekly, roster)
-
+    weekly, missing = _apply_roster_defaults_by_key(weekly, roster)
+    if missing:
+        raise ValueError("Missing SSN in roster for: " + ", ".join(missing))
     return weekly
 
 def _apply_roster_defaults_by_key(weekly_df: pd.DataFrame, roster: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, List[str]]:
-    weekly_df = weekly_df.copy()
-    weekly_df["k_lf"]  = weekly_df["employee"].map(lambda s: _key_last_first(*_name_parts(s)))
-    weekly_df["k_fl"]  = weekly_df["employee"].map(lambda s: _key_first_last(*_name_parts(s)[::-1]))
-    weekly_df["k_lfi"] = weekly_df["employee"].map(lambda s: _key_last_finit(*_name_parts(s)))
+    if roster is None:
+        missing = sorted(weekly_df.loc[weekly_df["ssn"].astype(str).isin(["", "nan", "None"]), "employee"].unique().tolist())
+        return weekly_df.drop(columns=["emp_key"]), missing
 
-    if roster is None or roster.empty:
-        missing = sorted(weekly_df["employee"].unique().tolist())
-        final = weekly_df.drop(columns=["k_lf","k_fl","k_lfi","emp_key"])
-        return final, missing
+    merged = weekly_df.merge(
+        roster[["employee_key","employee_disp","ssn","rate_roster","department_roster","wtype_roster"]],
+        left_on="emp_key", right_on="employee_key", how="left"
+    )
 
-    def _merge_on(key):
-        cols = ["employee_disp","ssn","rate_roster","department_roster","wtype_roster","k_lf","k_fl","k_lfi"]
-        r = roster[cols].copy()
-        return weekly_df.merge(r, left_on=key, right_on=key, how="left", suffixes=("","_r"))
-
-    m1 = _merge_on("k_lf")
-    m2 = _merge_on("k_fl")
-    for col in ["employee_disp","ssn","rate_roster","department_roster","wtype_roster"]:
-        m1[col] = m1[col].fillna(m2[col])
-    m3 = _merge_on("k_lfi")
-    for col in ["employee_disp","ssn","rate_roster","department_roster","wtype_roster"]:
-        m1[col] = m1[col].fillna(m3[col])
-
-    # Choose final fields (prefer weekly values; fallback to roster)
-    m1["ssn"] = m1["ssn"].fillna("")
-    m1["department"] = m1.apply(
+    merged["ssn"] = merged.apply(lambda r: r["ssn_y"] if str(r["ssn_y"]).strip() not in ("", "nan", "None") else "", axis=1)
+    merged["department"] = merged.apply(
         lambda r: r["department"] if str(r["department"]).strip() not in ("", "nan", "None")
         else (r["department_roster"] if pd.notna(r["department_roster"]) else ""), axis=1
     )
-    m1["Type"] = m1.apply(
+    merged["Type"] = merged.apply(
         lambda r: r["Type"] if str(r["Type"]).strip() not in ("", "nan", "None")
         else ("S" if str(r.get("wtype_roster","")).upper().startswith("S") else "H"), axis=1
     )
-    m1["rate"] = m1.apply(
+    merged["rate"] = merged.apply(
         lambda r: r["rate"] if float(r["rate"] or 0) > 0
         else (float(r["rate_roster"]) if pd.notna(r["rate_roster"]) else 0.0), axis=1
     )
 
-    missing = sorted(m1.loc[m1["ssn"].astype(str).isin(["", "nan", "None", ""]) , "employee"].unique().tolist())
-    final = m1[[
+    missing = sorted(merged.loc[merged["ssn"].astype(str).isin(["", "nan", "None", ""]) , "employee"].unique().tolist())
+    final = merged[[
         "employee","ssn","Status","Type","rate","department",
         "REG","OT","DT","REG_$","OT_$","DT_$","TOTAL_$"
     ]].copy()
@@ -395,7 +362,7 @@ def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> byte
     header_row, cols = _find_wbs_header(ws)
     first_data_row = header_row + 1
 
-    # clear old data rows
+    # clear old data
     scan_col = cols.get("name") or cols.get("ssn") or 2
     last = ws.max_row
     last_data = first_data_row - 1
@@ -405,7 +372,7 @@ def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> byte
     if last_data >= first_data_row:
         ws.delete_rows(first_data_row, last_data - first_data_row + 1)
 
-    # append weekly rows
+    # rows
     for _, row in weekly.iterrows():
         values = [""] * max(ws.max_column, 16)
         if cols.get("ssn")    : values[cols["ssn"]-1]    = row["ssn"]
@@ -423,7 +390,7 @@ def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> byte
         if cols.get("total$") : values[cols["total$"]-1] = row["TOTAL_$"]
         ws.append(values)
 
-    # spacer + TOTAL row
+    # spacer + TOTAL
     ws.append([])
     totals = {
         "REG": float(weekly["REG"].sum()),
@@ -445,34 +412,7 @@ def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> byte
     if cols.get("total$"): row_vals[cols["total$"]-1] = round(totals["TOTAL_$"], 2)
     ws.append(row_vals)
 
-    # --- Append MissingSSN report sheet (non-blocking) ---
-    try:
-        missing_rows = [r for r in weekly.to_dict(orient="records") if str(r.get("ssn","")).strip() in ("", "nan", "None")]
-        if missing_rows:
-            if "MissingSSN" in wb.sheetnames:
-                del wb["MissingSSN"]
-            ws_m = wb.create_sheet("MissingSSN")
-            cols_m = ["Employee Name","Dept","Type","Pay Rate","REG","OT","DT","REG_$","OT_$","DT_$","TOTAL_$"]
-            ws_m.append(cols_m)
-            for r in missing_rows:
-                ws_m.append([
-                    r.get("employee",""),
-                    r.get("department",""),
-                    r.get("Type",""),
-                    r.get("rate",""),
-                    r.get("REG",""),
-                    r.get("OT",""),
-                    r.get("DT",""),
-                    r.get("REG_$",""),
-                    r.get("OT_$",""),
-                    r.get("DT_$",""),
-                    r.get("TOTAL_$",""),
-                ])
-    except Exception:
-        pass  # never fail output due to report tab
-
     bio = io.BytesIO()
-    from openpyxl import Workbook  # ensure openpyxl present
     wb.save(bio); bio.seek(0)
     return bio.read()
 
@@ -495,6 +435,18 @@ def roster_status():
     if r is None:
         return JSONResponse({"roster":"missing"})
     return JSONResponse({"roster":"found","employees":int(r.drop_duplicates('employee_key').shape[0])})
+
+# (Optional) check matching for a specific name
+@app.get("/debug/lookup")
+def debug_lookup(name: str):
+    key = _canon_name(name)
+    roster = _load_roster_df()
+    if roster is None:
+        return {"error": "roster missing"}
+    matches = roster.loc[roster["employee_key"] == key]
+    if matches.empty:
+        return {"name": name, "canon_key": key, "match": False}
+    return {"name": name, "canon_key": key, "match": True, "roster_entry": matches.iloc[0].to_dict()}
 
 @app.post("/process-payroll")
 async def process_payroll(file: UploadFile = File(..., description="Sierra payroll .xlsx")):
