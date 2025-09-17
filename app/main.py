@@ -12,11 +12,11 @@ from starlette.responses import StreamingResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="5.0.1")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="6.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # lock this to your frontend origin later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,7 +29,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 SEARCH_DIRS = [BASE_DIR, BASE_DIR / "app", BASE_DIR / "app" / "data", BASE_DIR / "server"]
 
 def _find_file(basenames: List[str]) -> Optional[Path]:
-    # Allow env override
+    # env overrides
     env_map = {"wbs_template.xlsx": "WBS_TEMPLATE_PATH", "roster.xlsx": "ROSTER_PATH", "roster.csv": "ROSTER_PATH"}
     for name in basenames:
         env_key = env_map.get(name)
@@ -56,7 +56,7 @@ def _clean_space(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip()).replace(" ,", ",").replace(", ", ",")
 
 def _name_parts(name: str):
-    """Return (last, first_full) from 'Last, First ...' OR 'First ... Last'."""
+    """Return (last, first_full) for 'Last, First ...' or 'First ... Last'."""
     name = _clean_space(name)
     if "," in name:
         last, first = name.split(",", 1)
@@ -217,7 +217,7 @@ def _guess_rate_col(df: pd.DataFrame) -> Optional[str]:
             best, score = col, sc
     return best if score >= 0.2 else None
 
-# ---------------- build weekly (one row per employee) ----------------
+# ---------------- build weekly (supports Date+Hours OR Mon–Sun columns) ----------------
 def _ca_daily_ot(h: float) -> Dict[str, float]:
     h = float(h or 0.0)
     reg = min(h, 8.0); ot = min(max(h-8.0, 0.0), 4.0); dt = max(h-12.0, 0.0)
@@ -228,66 +228,95 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
     sheet = sheet_name or excel.sheet_names[0]
     df = excel.parse(sheet)
 
+    # --- Detect core columns ---
     emp_col  = _guess_employee_col(df)
-    date_col = _guess_date_col(df)
-    hrs_col  = _guess_hours_col(df)
     rate_col = _guess_rate_col(df)
-    missing = [k for k,v in {"employee":emp_col,"date":date_col,"hours":hrs_col,"rate":rate_col}.items() if not v]
-    if missing:
+    if not emp_col or not rate_col:
+        missing = [k for k,v in {"employee":emp_col,"rate":rate_col}.items() if not v]
         raise ValueError(f"Sierra header detection failed; missing: {', '.join(missing)}")
 
-    core = df[[emp_col, date_col, hrs_col, rate_col]].copy()
-    core.columns = ["employee","date","hours","rate"]
-
+    # Optional dept/type
     dep_col = _find_col(df, ["department","dept","division"])
     typ_col = _find_col(df, ["type","employee type","emp type","pay type"])
-    core["department"] = df[dep_col] if dep_col else ""
-    core["wtype"]      = df[typ_col] if typ_col else ""
-    core["ssn"]        = ""  # SSN comes from roster; not required here
 
-    # normalize & filter
-    core["employee"]   = core["employee"].astype(str).map(_clean_space)
-    core["emp_key"]    = core["employee"].map(_canon_name)
-    core["date"]       = core["date"].map(_to_date)
-    core["hours"]      = pd.to_numeric(core["hours"], errors="coerce").fillna(0.0).astype(float)
-    core["rate"]       = pd.to_numeric(core["rate"], errors="coerce").fillna(0.0).astype(float)
-    core["department"] = core["department"].astype(str).map(str.strip)
-    core["wtype"]      = core["wtype"].astype(str).map(str.strip)
+    # Normalize base identity columns
+    base = pd.DataFrame({
+        "employee":   df[emp_col].astype(str).map(_clean_space),
+        "rate":       pd.to_numeric(df[rate_col], errors="coerce").fillna(0.0).astype(float),
+        "department": (df[dep_col].astype(str).map(str.strip) if dep_col else ""),
+        "wtype":      (df[typ_col].astype(str).map(str.strip) if typ_col else ""),
+    })
+    base["emp_key"] = base["employee"].map(_canon_name)
 
-    core = core[(core["employee"].str.len()>0) & core["date"].notna() & (core["hours"]>0)]
-    if core.empty:
-        raise ValueError("No valid rows found in Sierra sheet (need Employee, Date, Hours > 0, Rate).")
+    # --- MODE 1: Date + Hours columns ---
+    date_col = _guess_date_col(df)
+    hrs_col  = _guess_hours_col(df)
+    has_date_hours = bool(date_col and hrs_col)
 
-    # 1) per-day totals
-    per_day = core.groupby(["emp_key","employee","date"], dropna=False).agg({"hours":"sum"}).reset_index()
+    # --- MODE 2: Weekday columns Mon..Sun ---
+    day_candidates = [
+        ("mon", ["mon","monday"]),
+        ("tue", ["tue","tues","tuesday"]),
+        ("wed", ["wed","weds","wednesday"]),
+        ("thu", ["thu","thur","thurs","thursday"]),
+        ("fri", ["fri","friday"]),
+        ("sat", ["sat","saturday"]),
+        ("sun", ["sun","sunday"]),
+    ]
+    day_cols: Dict[str,str] = {}
+    normcols = { _std(c): c for c in df.columns }
+    for day_key, aliases in day_candidates:
+        found = None
+        for alias in aliases:
+            for k,c in normcols.items():
+                if alias in k:
+                    found = c
+                    break
+            if found: break
+        if found:
+            day_cols[day_key] = found
+    has_weekdays = len(day_cols) >= 4   # flexible: at least 4 day columns means weekly layout
 
-    # 2) daily OT/DT split
-    parts = []
-    for _, r in per_day.iterrows():
-        d = _ca_daily_ot(float(r["hours"]))
-        parts.append({"emp_key": r["emp_key"], "employee": r["employee"], "date": r["date"], "REG": d["REG"], "OT": d["OT"], "DT": d["DT"]})
-    split_df = pd.DataFrame(parts)
+    if not has_date_hours and not has_weekdays:
+        raise ValueError("Could not find Date+Hours or weekday (Mon..Sun) columns in Sierra file.")
 
-    # 3) weekly hours by employee
-    weekly_hours = split_df.groupby(["emp_key","employee"], dropna=False)[["REG","OT","DT"]].sum().reset_index()
+    # ---------- Build tidy per-day records ----------
+    per_day_frames: List[pd.DataFrame] = []
 
-    # 4) dollars proportional by day/rate
-    dollars = defaultdict(lambda: {"REG_$":0.0,"OT_$":0.0,"DT_$":0.0})
-    day_totals = { (r["emp_key"], r["date"]): r for _, r in split_df.iterrows() }
+    if has_date_hours:
+        tmp = pd.DataFrame({
+            "emp_key":    base["emp_key"],
+            "employee":   base["employee"],
+            "date":       df[date_col].map(_to_date),
+            "hours":      pd.to_numeric(df[hrs_col], errors="coerce").fillna(0.0).astype(float),
+            "rate":       base["rate"],
+            "department": base["department"],
+            "wtype":      base["wtype"],
+        })
+        tmp = tmp[(tmp["employee"].str.len() > 0) & tmp["date"].notna() & (tmp["hours"] > 0)]
+        per_day_frames.append(tmp)
 
-    for _, rec in core.iterrows():
-        key = (rec["emp_key"], rec["date"])
-        if key not in day_totals: continue
-        tot = day_totals[key]
-        day_sum = float(tot["REG"] + tot["OT"] + tot["DT"])
-        if day_sum <= 0: continue
-        portion = float(rec["hours"]) / day_sum
-        base = float(rec["rate"])
-        dollars[rec["emp_key"]]["REG_$"] += tot["REG"] * portion * base
-        dollars[rec["emp_key"]]["OT_$"]  += tot["OT"]  * portion * base * 1.5
-        dollars[rec["emp_key"]]["DT_$"]  += tot["DT"]  * portion * base * 2.0
+    if has_weekdays:
+        for day_key, col in day_cols.items():
+            hrs = pd.to_numeric(df[col], errors="coerce").fillna(0.0).astype(float)
+            tmp = pd.DataFrame({
+                "emp_key":    base["emp_key"],
+                "employee":   base["employee"],
+                "date":       day_key,  # token per day; OT/DT split is per day token
+                "hours":      hrs,
+                "rate":       base["rate"],
+                "department": base["department"],
+                "wtype":      base["wtype"],
+            })
+            tmp = tmp[(tmp["employee"].str.len() > 0) & (tmp["hours"] > 0)]
+            per_day_frames.append(tmp)
 
-    # 5) chosen display rate/type/dept
+    if not per_day_frames:
+        raise ValueError("No valid rows found in Sierra sheet after parsing.")
+
+    core = pd.concat(per_day_frames, ignore_index=True)
+
+    # Choose display rate/type/dept (most common / first seen)
     chosen_rate, first_dept, first_type = {}, {}, {}
     for k,g in core.groupby("emp_key"):
         rates = Counter([float(r) for r in g["rate"].tolist()])
@@ -296,15 +325,46 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
         wtyp = str(g["wtype"].dropna().astype(str).replace("nan","").iloc[0] if not g.empty else "")
         first_type[k]  = "S" if wtyp.upper().startswith("S") else "H"
 
+    # Daily OT/DT split per employee+day
+    parts = []
+    for (k, emp, day), g in core.groupby(["emp_key","employee","date"], dropna=False):
+        day_hours = float(g["hours"].sum())
+        split = _ca_daily_ot(day_hours)
+        parts.append({"emp_key": k, "employee": emp, "date": day,
+                      "REG": split["REG"], "OT": split["OT"], "DT": split["DT"]})
+    split_df = pd.DataFrame(parts)
+
+    # Weekly hours per employee
+    weekly_hours = split_df.groupby(["emp_key","employee"], dropna=False)[["REG","OT","DT"]].sum().reset_index()
+
+    # Dollars by day proportional to hours & rate
+    dollars = defaultdict(lambda: {"REG_$":0.0,"OT_$":0.0,"DT_$":0.0})
+    day_totals = {(r["emp_key"], r["date"]): r for _, r in split_df.iterrows()}
+
+    for _, rec in core.iterrows():
+        key = (rec["emp_key"], rec["date"])
+        if key not in day_totals: 
+            continue
+        tot = day_totals[key]
+        day_sum = float(tot["REG"] + tot["OT"] + tot["DT"])
+        if day_sum <= 0:
+            continue
+        portion = float(rec["hours"]) / day_sum
+        base_rate = float(rec["rate"])
+        dollars[rec["emp_key"]]["REG_$"] += tot["REG"] * portion * base_rate
+        dollars[rec["emp_key"]]["OT_$"]  += tot["OT"]  * portion * base_rate * 1.5
+        dollars[rec["emp_key"]]["DT_$"]  += tot["DT"]  * portion * base_rate * 2.0
+
+    # Assemble weekly rows
     weekly = weekly_hours.copy()
     weekly["REG_$"]   = weekly["emp_key"].map(lambda k: round(_money(dollars[k]["REG_$"]), 2))
-    weekly["OT_$"]    = weekly["emp_key"].map(lambda k: round(_money(dollars[k]["OT_$"]), 2))
-    weekly["DT_$"]    = weekly["emp_key"].map(lambda k: round(_money(dollars[k]["DT_$"]), 2))
+    weekly["OT_$"]    = weekly["emp_key"].map(lambda k: round(_money(dollars[k]["OT_$"]),  2))
+    weekly["DT_$"]    = weekly["emp_key"].map(lambda k: round(_money(dollars[k]["DT_$"]),  2))
     weekly["TOTAL_$"] = weekly["REG_$"] + weekly["OT_$"] + weekly["DT_$"]
 
     weekly["rate"]       = weekly["emp_key"].map(lambda k: round(_money(chosen_rate.get(k, 0.0)), 2))
     weekly["department"] = weekly["emp_key"].map(lambda k: first_dept.get(k, ""))
-    weekly["ssn"]        = ""  # will be filled from roster if available
+    weekly["ssn"]        = ""  # may be filled from roster
     weekly["Status"]     = "A"
     weekly["Type"]       = weekly["emp_key"].map(lambda k: first_type.get(k, "H"))
 
@@ -316,10 +376,9 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
         "REG","OT","DT","REG_$","OT_$","DT_$","TOTAL_$"
     ]].copy()
 
-    # Merge roster by robust keys (LF, FL, L+FI). Never raise on missing SSN.
+    # Merge roster (non-blocking on SSNs)
     roster = _load_roster_df()
     weekly, _ = _apply_roster_defaults_by_key(weekly, roster)
-
     return weekly
 
 def _apply_roster_defaults_by_key(weekly_df: pd.DataFrame, roster: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, List[str]]:
@@ -346,7 +405,7 @@ def _apply_roster_defaults_by_key(weekly_df: pd.DataFrame, roster: Optional[pd.D
     for col in ["employee_disp","ssn","rate_roster","department_roster","wtype_roster"]:
         m1[col] = m1[col].fillna(m3[col])
 
-    # Choose final fields (prefer weekly values; fallback to roster)
+    # Finalize fields
     m1["ssn"] = m1["ssn"].fillna("")
     m1["department"] = m1.apply(
         lambda r: r["department"] if str(r["department"]).strip() not in ("", "nan", "None")
