@@ -15,11 +15,11 @@ from openpyxl.worksheet.worksheet import Worksheet
 # --------------------------------------------------------------------------------------
 # App
 # --------------------------------------------------------------------------------------
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="4.1.0")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="4.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later to your frontend domain
+    allow_origins=["*"],  # tighten to your frontend domain later if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -28,13 +28,12 @@ app.add_middleware(
 ALLOWED_EXTS = (".xlsx", ".xls")
 
 # --------------------------------------------------------------------------------------
-# Paths & file discovery (supports root/app/app/data/server)
+# Paths & file discovery (root/app/app/data/server + env override)
 # --------------------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parents[1]
 SEARCH_DIRS = [BASE_DIR, BASE_DIR / "app", BASE_DIR / "app" / "data", BASE_DIR / "server"]
 
 def _find_file(basenames: List[str]) -> Optional[Path]:
-    # env override wins
     for env_key in ("WBS_TEMPLATE_PATH", "ROSTER_PATH"):
         p = os.getenv(env_key)
         if p and Path(p).exists():
@@ -64,7 +63,7 @@ def _normalize_name(raw: str) -> str:
     return raw.strip()
 
 def _canon_name(s: str) -> str:
-    """Case-insensitive, accent-free, single-space, standard comma key."""
+    """Case-insensitive, accent-free, single-space, normalized comma key."""
     if not isinstance(s, str):
         s = str(s or "")
     s = s.strip()
@@ -72,7 +71,7 @@ def _canon_name(s: str) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.replace(".", "")
     s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\s*,\s*", ",", s)  # normalize "Last, First"
+    s = re.sub(r"\s*,\s*", ",", s)
     return s.lower()
 
 def _to_date(v) -> Optional[date]:
@@ -126,7 +125,7 @@ def _load_roster_df() -> Optional[pd.DataFrame]:
     if not p:
         return None
     if p.suffix.lower() == ".xlsx":
-        df = pd.read_excel(p, dtype=str)  # preserve zeros in SSN
+        df = pd.read_excel(p, dtype=str)
     else:
         df = pd.read_csv(p, dtype=str)
     if df.empty:
@@ -143,13 +142,12 @@ def _load_roster_df() -> Optional[pd.DataFrame]:
 
     out = pd.DataFrame({
         "employee_disp": df[name_col].astype(str).map(str.strip),
-        "employee_key": df[name_col].astype(str).map(_canon_name),
-        "ssn": df[ssn_col].astype(str).map(str.strip),
-        "rate_roster": pd.to_numeric(df[rate_col], errors="coerce") if rate_col else pd.Series([None]*len(df)),
+        "employee_key":  df[name_col].astype(str).map(_canon_name),
+        "ssn":           df[ssn_col].astype(str).map(str.strip),
+        "rate_roster":   pd.to_numeric(df[rate_col], errors="coerce") if rate_col else pd.Series([None]*len(df)),
         "department_roster": df[dept_col].astype(str).map(str.strip) if dept_col else pd.Series([""]*len(df)),
-        "wtype_roster": df[type_col].astype(str).map(str.strip) if type_col else pd.Series([""]*len(df)),
-    })
-    out = out.dropna(subset=["employee_key"]).drop_duplicates(subset=["employee_key"], keep="last")
+        "wtype_roster":      df[type_col].astype(str).map(str.strip) if type_col else pd.Series([""]*len(df)),
+    }).dropna(subset=["employee_key"]).drop_duplicates(subset=["employee_key"], keep="last")
     return out
 
 # --------------------------------------------------------------------------------------
@@ -162,13 +160,14 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
 
     required = {
         "employee": ["employee","employee name","name","worker","employee_name"],
-        "date": ["date","work date","day","worked date"],
-        "hours": ["hours","hrs","total hours","work hours"],
-        "rate": ["rate","pay rate","hourly rate","wage"],
+        "date":     ["date","work date","day","worked date"],
+        "hours":    ["hours","hrs","total hours","work hours"],
+        "rate":     ["rate","pay rate","hourly rate","wage"],
     }
     optional = {
         "department": ["department","dept","division"],
-        "ssn": ["ssn","social","social security","social security number"],
+        # DO NOT read SSN from Sierra; it isn't there.
+        # "ssn": ["ssn","social","social security","social security number"],
         "wtype": ["type","employee type","emp type","pay type"],
     }
 
@@ -177,11 +176,10 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
     core.columns = ["employee","date","hours","rate"]
 
     dep_col = _find_col(df, optional["department"])
-    ssn_col = _find_col(df, optional["ssn"])
     typ_col = _find_col(df, optional["wtype"])
     core["department"] = df[dep_col] if dep_col else ""
-    core["ssn"]        = df[ssn_col] if ssn_col else ""
     core["wtype"]      = df[typ_col] if typ_col else ""
+    core["ssn"]        = ""  # always blank; will be filled from roster
 
     # Normalize & keys
     core["employee"]   = core["employee"].astype(str).map(_normalize_name)
@@ -190,7 +188,6 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
     core["hours"]      = pd.to_numeric(core["hours"], errors="coerce").fillna(0.0).astype(float)
     core["rate"]       = pd.to_numeric(core["rate"], errors="coerce").fillna(0.0).astype(float)
     core["department"] = core["department"].astype(str).map(str.strip)
-    core["ssn"]        = core["ssn"].astype(str).map(str.strip)
     core["wtype"]      = core["wtype"].astype(str).map(str.strip)
 
     core = core[(core["employee"].str.len()>0) & core["date"].notna() & (core["hours"]>0)]
@@ -232,12 +229,11 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
         dollars[rec["emp_key"]]["DT_$"]  += dt_share  * base * 2.0
 
     # 5) Display rate = most frequent weekly rate
-    chosen_rate, first_dept, first_ssn, first_type = {}, {}, {}, {}
+    chosen_rate, first_dept, first_type = {}, {}, {}
     for emp_key, group in core.groupby("emp_key"):
         rates = Counter([float(r) for r in group["rate"].tolist()])
         chosen_rate[emp_key] = max(rates.items(), key=lambda kv: kv[1])[0]
         first_dept[emp_key]  = group["department"].dropna().astype(str).replace("nan","").iloc[0] if not group.empty else ""
-        first_ssn[emp_key]   = group["ssn"].dropna().astype(str).replace("nan","").iloc[0] if not group.empty else ""
         wtyp = str(group["wtype"].dropna().astype(str).replace("nan","").iloc[0] if not group.empty else "")
         first_type[emp_key]  = "S" if wtyp.upper().startswith("S") else "H"
 
@@ -249,7 +245,7 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
 
     weekly["rate"]       = weekly["emp_key"].map(lambda k: round(_money(chosen_rate.get(k, 0.0)), 2))
     weekly["department"] = weekly["emp_key"].map(lambda k: first_dept.get(k, ""))
-    weekly["ssn"]        = weekly["emp_key"].map(lambda k: first_ssn.get(k, ""))
+    weekly["ssn"]        = ""  # will be filled from roster
     weekly["Status"]     = "A"
     weekly["Type"]       = weekly["emp_key"].map(lambda k: first_type.get(k, "H"))
 
@@ -279,10 +275,9 @@ def _apply_roster_defaults_by_key(weekly_df: pd.DataFrame, roster: Optional[pd.D
         left_on="emp_key", right_on="employee_key", how="left"
     )
 
-    # Choose SSN: prefer Sierra/weekly if present, else roster
+    # SSN only from roster (Sierra had none)
     merged["ssn"] = merged.apply(
-        lambda r: r["ssn"] if str(r["ssn"]).strip() not in ("", "nan", "None")
-        else (r["ssn_y"] if pd.notna(r["ssn_y"]) else ""), axis=1
+        lambda r: r["ssn_y"] if str(r["ssn_y"]).strip() not in ("", "nan", "None") else "", axis=1
     )
 
     # Department / Type
@@ -294,13 +289,13 @@ def _apply_roster_defaults_by_key(weekly_df: pd.DataFrame, roster: Optional[pd.D
         lambda r: r["Type"] if str(r["Type"]).strip() not in ("", "nan", "None")
         else ("S" if str(r.get("wtype_roster","")).upper().startswith("S") else "H"), axis=1
     )
-    # Rate: keep computed, else roster's default if provided
+
+    # Rate: keep computed; if 0 and roster has a default, use it
     merged["rate"] = merged.apply(
         lambda r: r["rate"] if float(r["rate"] or 0) > 0
         else (float(r["rate_roster"]) if pd.notna(r["rate_roster"]) else 0.0), axis=1
     )
 
-    # Missing after roster fill?
     missing = sorted(merged.loc[merged["ssn"].astype(str).isin(["", "nan", "None"]), "employee"].unique().tolist())
 
     final = merged[[
@@ -417,15 +412,6 @@ def roster_status():
     if r is None:
         return JSONResponse({"roster":"missing"})
     return JSONResponse({"roster":"found","employees":int(r.drop_duplicates('employee_key').shape[0])})
-
-@app.get("/debug/roster-compare")
-def roster_compare():
-    # Lightweight diff to diagnose matching
-    roster = _load_roster_df()
-    if roster is None:
-        return JSONResponse({"roster":"missing"}, status_code=422)
-    roster_keys = set(roster["employee_key"].dropna().tolist())
-    return JSONResponse({"roster_keys": len(roster_keys)})
 
 @app.post("/process-payroll")
 async def process_payroll(file: UploadFile = File(..., description="Sierra payroll .xlsx")):
