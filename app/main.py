@@ -1,142 +1,275 @@
-# app/main.py
-from __future__ import annotations
+# server/main.py
+import io
+from datetime import datetime, date
+from typing import Dict, List, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Response
-from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse, JSONResponse
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from io import BytesIO
-from pathlib import Path
-import csv
+from starlette.responses import StreamingResponse, JSONResponse
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
-# ---------- deps for simple sanity + converter ----------
-import openpyxl
+# ------------------------------------------------------------------------------
+# App + CORS (adjust allow_origins to your frontend domain if needed)
+# ------------------------------------------------------------------------------
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="1.0.0")
 
-# Import the real converter if it exists
-do_convert = None
-try:
-    # your converter file you shared earlier
-    from app.converter import convert_from_buffers as _convert_from_buffers  # type: ignore
-    do_convert = _convert_from_buffers
-except Exception:
-    # if converter.py is missing or broken, we safely fall back to echo
-    do_convert = None
-
-# =====================================================================================
-# FastAPI app
-# =====================================================================================
-app = FastAPI(title="Sierra Payroll Backend")
-
-# ====== CORS: wide-open to kill the browser “Network Error” immediately ======
-# (We can lock to your Netlify origin later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # must be "*" when allow_credentials=False
-    allow_credentials=False,
+    allow_origins=["*"],   # tighten to your Netlify domain if desired
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=86400,
 )
 
-# Ensure OPTIONS preflight always succeeds
-@app.options("/{path:path}")
-async def preflight(_: str) -> Response:
-    return Response(status_code=204)
+ALLOWED_EXTS = (".xlsx", ".xls")
 
-# =====================================================================================
-# Health / root
-# =====================================================================================
-@app.get("/health")
-async def health():
-    return {"ok": True}
+# ------------------------------------------------------------------------------
+# Helpers (no fuzzy math; only mild header matching — numbers remain exact)
+# ------------------------------------------------------------------------------
+def _ext_ok(filename: str) -> bool:
+    name = (filename or "").lower()
+    return any(name.endswith(e) for e in ALLOWED_EXTS)
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return """
-<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>Sierra Payroll Backend</title></head>
-  <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin:24px">
-    <h2>Sierra Payroll Backend</h2>
-    <ul>
-      <li><code>GET /health</code> → {"ok": true}</li>
-      <li><code>GET /employees</code> → list employees from <code>app/data/roster.csv</code></li>
-      <li><code>POST /process-payroll</code> → form-data field <b>file</b> (.xlsx); returns WBS .xlsx</li>
-    </ul>
-  </body>
-</html>
-    """
+def _std_col(s: str) -> str:
+    return (s or "").strip().lower().replace("\n", " ").replace("\r", " ")
 
-# =====================================================================================
-# Employees (used by your “Manage Employees” tab)
-# Reads app/data/roster.csv if present. Non-fatal if missing.
-# =====================================================================================
-def _read_roster_csv() -> list[dict]:
-    roster_path = Path(__file__).parent / "data" / "roster.csv"
-    out: list[dict] = []
-    if not roster_path.exists():
-        return out
-    with roster_path.open("r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            # normalize a few expected keys used by the UI
-            out.append({
-                "empid": (r.get("EmpID") or r.get("empid") or "").strip(),
-                "ssn": (r.get("SSN") or r.get("ssn") or "").strip(),
-                "name": (r.get("Employee Name") or r.get("EmployeeName") or r.get("name") or "").strip(),
-                "status": (r.get("Status") or r.get("status") or "").strip(),
-                "type": (r.get("Type") or r.get("type") or "").strip(),
-                "pay_rate": float((r.get("PayRate") or r.get("Pay Rate") or r.get("pay_rate") or "0").replace("$","").strip() or 0),
-                "department": (r.get("Dept") or r.get("Department") or r.get("dept") or "").strip(),
-            })
-    return out
+def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = { _std_col(c): c for c in df.columns }
+    for want in candidates:
+        key = _std_col(want)
+        if key in cols:
+            return cols[key]
+    # relaxed contains (headers only)
+    for want in candidates:
+        key = _std_col(want)
+        for k, v in cols.items():
+            if key in k:
+                return v
+    return None
 
-@app.get("/employees")
-async def list_employees():
+def _require_columns(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> Dict[str, str]:
+    resolved, missing = {}, []
+    for logical, options in mapping.items():
+        col = _find_col(df, options)
+        if not col:
+            missing.append(f"{logical} (any of: {', '.join(options)})")
+        else:
+            resolved[logical] = col
+    if missing:
+        raise ValueError("Missing required columns: " + "; ".join(missing))
+    return resolved
+
+def _normalize_name(raw: str) -> str:
+    if not raw or not isinstance(raw, str):
+        return ""
+    name = raw.strip()
+    parts = [p for p in name.split() if p]
+    if len(parts) == 2:
+        # "First Last" -> "Last, First"
+        return f"{parts[1]}, {parts[0]}"
+    return name
+
+def _to_date(val) -> Optional[date]:
+    if pd.isna(val):
+        return None
+    if isinstance(val, datetime):
+        return val.date()
     try:
-        return JSONResponse(_read_roster_csv())
-    except Exception as e:
-        # Still return a JSON error instead of exploding
-        return JSONResponse({"error": f"Failed to read roster: {e}"}, status_code=500)
+        return pd.to_datetime(val).date()
+    except Exception:
+        return None
 
-# =====================================================================================
-# Payroll processing endpoint expected by your frontend:
-#  - route: POST /process-payroll
-#  - form field name: "file"  (your page sends this)
-#  - returns: WBS .xlsx
-# =====================================================================================
+def _apply_ca_daily_ot(day_hours: float) -> Dict[str, float]:
+    """
+    California daily OT:
+      - first 8: REG
+      - next 4 (8–12): OT
+      - >12: DT
+    """
+    h = float(day_hours or 0.0)
+    reg = min(h, 8.0)
+    ot = 0.0
+    dt = 0.0
+    if h > 8:
+        ot = min(h - 8.0, 4.0)
+    if h > 12:
+        dt = h - 12.0
+    return {"REG": reg, "OT": ot, "DT": dt}
+
+def _money(x: float) -> float:
+    # keep exact math; only round at Excel write
+    return float(x or 0.0)
+
+# ------------------------------------------------------------------------------
+# Core conversion
+# ------------------------------------------------------------------------------
+def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) -> bytes:
+    excel = pd.ExcelFile(io.BytesIO(input_bytes))
+    target_sheet = sheet_name or excel.sheet_names[0]
+    df = excel.parse(target_sheet)
+
+    if df.empty:
+        raise ValueError("Input sheet is empty.")
+
+    required = {
+        "employee": ["employee", "employee name", "name", "worker", "employee_name"],
+        "date": ["date", "work date", "day", "worked date"],
+        "hours": ["hours", "hrs", "total hours", "work hours"],
+        "rate": ["rate", "pay rate", "hourly rate", "wage"],
+    }
+    optional = {
+        "department": ["department", "dept", "division"],
+        "ssn": ["ssn", "social", "social security", "social security number"],
+        "wtype": ["type", "employee type", "emp type", "pay type"],
+        "task": ["task", "earn type", "earning", "code"],
+    }
+
+    resolved_req = _require_columns(df, required)
+    resolved_opt = {k: _find_col(df, v) for k, v in optional.items()}
+
+    core = df[[resolved_req["employee"], resolved_req["date"], resolved_req["hours"], resolved_req["rate"]]].copy()
+    core.columns = ["employee", "date", "hours", "rate"]
+
+    # Attach optionals if present (do not modify numeric values)
+    core["department"] = df[resolved_opt["department"]] if resolved_opt["department"] else ""
+    core["ssn"]        = df[resolved_opt["ssn"]] if resolved_opt["ssn"] else ""
+    core["wtype"]      = df[resolved_opt["wtype"]] if resolved_opt["wtype"] else ""
+    core["task"]       = df[resolved_opt["task"]] if resolved_opt["task"] else ""
+
+    # Normalize types
+    core["employee"] = core["employee"].astype(str).map(_normalize_name)
+    core["date"]     = core["date"].map(_to_date)
+    core["hours"]    = pd.to_numeric(core["hours"], errors="coerce").fillna(0.0).astype(float)
+    core["rate"]     = pd.to_numeric(core["rate"], errors="coerce").fillna(0.0).astype(float)
+
+    # Keep only valid rows
+    core = core[(core["employee"].str.len() > 0) & core["date"].notna() & (core["hours"] > 0)]
+
+    # Sum per employee/day, then apply CA daily OT split
+    day_group = core.groupby(["employee", "date", "rate"], dropna=False)["hours"].sum().reset_index()
+
+    split_rows = []
+    for _, row in day_group.iterrows():
+        dist = _apply_ca_daily_ot(float(row["hours"]))
+        split_rows.append({
+            "employee": row["employee"],
+            "date": row["date"],
+            "rate": float(row["rate"]),
+            "REG": dist["REG"],
+            "OT": dist["OT"],
+            "DT": dist["DT"],
+        })
+    split_df = pd.DataFrame(split_rows)
+
+    # Weekly totals by employee
+    weekly = split_df.groupby(["employee", "rate"], dropna=False)[["REG", "OT", "DT"]].sum().reset_index()
+
+    # Dollars
+    weekly["REG_$"]   = weekly["REG"] * weekly["rate"]
+    weekly["OT_$"]    = weekly["OT"]  * weekly["rate"] * 1.5
+    weekly["DT_$"]    = weekly["DT"]  * weekly["rate"] * 2.0
+    weekly["TOTAL_$"] = weekly["REG_$"] + weekly["OT_$"] + weekly["DT_$"]
+
+    # Bring over identity columns (first non-null seen)
+    id_map = (
+        core.groupby("employee")
+            .agg({"department": "first", "ssn": "first", "wtype": "first"})
+            .reset_index()
+    )
+    out = pd.merge(weekly, id_map, on="employee", how="left")
+
+    # WBS identity defaults
+    out["Status"] = "A"
+    out["Type"] = out["wtype"].astype(str).str.upper().map(lambda x: "S" if x.startswith("S") else "H")
+
+    # Final WBS column order
+    wbs_cols = [
+        "Status",            # A
+        "Type",              # H/S
+        "employee",          # Last, First
+        "ssn",               # may be blank if not provided
+        "department",        # optional
+        "rate",              # pay rate
+        "REG",               # A01
+        "OT",                # A02
+        "DT",                # A03
+        "REG_$",
+        "OT_$",
+        "DT_$",
+        "TOTAL_$",
+    ]
+    out = out[wbs_cols].copy()
+
+    # Build Excel in-memory
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "WEEKLY"
+
+    header1 = ["", "", "WEEKLY PAYROLL", "", "", "", "", "", "", "", "", "", ""]
+    header2 = ["Status", "Type", "Employee", "SSN", "Department", "Pay Rate",
+               "REG (A01)", "OT (A02)", "DT (A03)", "REG $", "OT $", "DT $", "TOTAL $"]
+    ws.append(header1)
+    ws.append(header2)
+
+    for _, r in out.iterrows():
+        ws.append([
+            r["Status"],
+            r["Type"],
+            r["employee"],
+            r["ssn"],
+            r["department"],
+            round(_money(r["rate"]), 2),
+            round(_money(r["REG"]), 2),
+            round(_money(r["OT"]), 2),
+            round(_money(r["DT"]), 2),
+            round(_money(r["REG_$"]), 2),
+            round(_money(r["OT_$"]), 2),
+            round(_money(r["DT_$"]), 2),
+            round(_money(r["TOTAL_$"]), 2),
+        ])
+
+    # Nice widths
+    for col_idx in range(1, 14):
+        col = get_column_letter(col_idx)
+        max_len = 12
+        for cell in ws[col]:
+            if cell.value is None:
+                continue
+            max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[col].width = min(max_len + 2, 30)
+
+    # Return bytes
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.read()
+
+# ------------------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return JSONResponse({"ok": True, "ts": datetime.utcnow().isoformat() + "Z"})
+
 @app.post("/process-payroll")
 async def process_payroll(file: UploadFile = File(...)):
-    # Basic validations
-    name = (file.filename or "").lower()
-    if not name.endswith(".xlsx"):
-        raise HTTPException(status_code=422, detail="Please upload a .xlsx Excel file.")
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No selected file.")
+    if not _ext_ok(file.filename):
+        raise HTTPException(status_code=415, detail="Unsupported file type. Please upload .xlsx or .xls")
 
     try:
-        data = await file.read()
-
-        # If we have the real converter, use it (with optional roster.xlsx support in the future)
-        if do_convert is not None:
-            out_bytes, out_name = do_convert(sierra_xlsx=data, roster_xlsx=None)  # converter handles logic
-            return StreamingResponse(
-                BytesIO(out_bytes),
-                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                headers={"Content-Disposition": f'attachment; filename="{out_name}"'}
-            )
-
-        # ---- Fallback (converter missing): echo a valid workbook so UI flow still works ----
-        wb = openpyxl.load_workbook(BytesIO(data), data_only=True)
-        bio = BytesIO()
-        wb.save(bio)
-        bio.seek(0)
+        contents = await file.read()
+        out_bytes = convert_sierra_to_wbs(contents, sheet_name=None)
+        out_name = f"WBS_Payroll_{datetime.utcnow().date().isoformat()}.xlsx"
         return StreamingResponse(
-            bio,
+            io.BytesIO(out_bytes),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": 'attachment; filename="WBS_Payroll.xlsx"'}
+            headers={"Content-Disposition": f'attachment; filename="{out_name}"'}
         )
-
-    except HTTPException:
-        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
     except Exception as e:
-        # Return a clean 400 to the UI with detail message
-        return PlainTextResponse(f"Failed to process payroll: {e}", status_code=400)
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
