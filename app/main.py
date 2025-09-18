@@ -1,4 +1,4 @@
-# server/main.py
+# app/main.py
 import io
 from collections import defaultdict, Counter
 from datetime import datetime, date
@@ -12,11 +12,11 @@ from starlette.responses import StreamingResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="3.0.1")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="3.0.2")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your Netlify origin if desired
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,41 +24,19 @@ app.add_middleware(
 
 ALLOWED_EXTS = (".xlsx", ".xls")
 
-# WBS template layout
+# WBS template layout (columns are 1-based)
 WBS_DATA_START_ROW = 9
 COL = {
-    "EMP_ID": 1,
-    "SSN": 2,
-    "EMP_NAME": 3,
-    "STATUS": 4,
-    "TYPE": 5,
-    "PAY_RATE": 6,
-    "DEPT": 7,
-    "A01": 8,
-    "A02": 9,
-    "A03": 10,
-    "A06": 11,
-    "A07": 12,
-    "A08": 13,
-    "A04": 14,
-    "A05": 15,
-    "AH1": 16, "AI1": 17,
-    "AH2": 18, "AI2": 19,
-    "AH3": 20, "AI3": 21,
-    "AH4": 22, "AI4": 23,
-    "AH5": 24, "AI5": 25,
-    "ATE": 26,
-    "COMMENTS": 27,
-    "TOTALS": 28,
+    "EMP_ID": 1, "SSN": 2, "EMP_NAME": 3, "STATUS": 4, "TYPE": 5, "PAY_RATE": 6, "DEPT": 7,
+    "A01": 8, "A02": 9, "A03": 10, "A06": 11, "A07": 12, "A08": 13, "A04": 14, "A05": 15,
+    "AH1": 16, "AI1": 17, "AH2": 18, "AI2": 19, "AH3": 20, "AI3": 21, "AH4": 22, "AI4": 23, "AH5": 24, "AI5": 25,
+    "ATE": 26, "COMMENTS": 27, "TOTALS": 28,
 }
+
 ROSTER_SHEET_NAME = "Roster"
 PIECEWORK_SHEET_NAME = "Piecework"
 
-# ------------------------- helpers -------------------------
-def _ext_ok(filename: str) -> bool:
-    fn = (filename or "").lower()
-    return any(fn.endswith(e) for e in ALLOWED_EXTS)
-
+# ---------------- helpers ----------------
 def _std(s: str) -> str:
     return (s or "").strip().lower().replace("\n", " ").replace("\r", " ")
 
@@ -76,16 +54,11 @@ def _normalize_name(raw: str) -> str:
     return name
 
 def _to_date(val):
-    if pd.isna(val):
-        return None
-    if isinstance(val, date):
-        return val
-    if isinstance(val, datetime):
-        return val.date()
-    try:
-        return pd.to_datetime(val).date()
-    except Exception:
-        return None
+    if pd.isna(val): return None
+    if isinstance(val, date): return val
+    if isinstance(val, datetime): return val.date()
+    try: return pd.to_datetime(val).date()
+    except Exception: return None
 
 def _weekday_from_any(val) -> Optional[int]:
     d = _to_date(val)
@@ -93,40 +66,28 @@ def _weekday_from_any(val) -> Optional[int]:
         wd = d.weekday()  # Mon=0
         return wd + 1 if 0 <= wd <= 4 else None
     s = str(val or "").strip().lower()
-    m = {
-        "m":1,"mon":1,"monday":1,
-        "t":2,"tu":2,"tue":2,"tuesday":2,
-        "w":3,"wed":3,"wednesday":3,
-        "th":4,"thu":4,"thur":4,"thurs":4,"thursday":4,
-        "f":5,"fri":5,"friday":5
-    }
+    m = {"m":1,"mon":1,"monday":1,"t":2,"tu":2,"tue":2,"tuesday":2,"w":3,"wed":3,"wednesday":3,
+         "th":4,"thu":4,"thur":4,"thurs":4,"thursday":4,"f":5,"fri":5,"friday":5}
     return m.get(s)
 
 def _apply_ca_daily_ot(hours: float) -> Dict[str, float]:
     h = float(hours or 0.0)
-    a01 = min(h, 8.0)
-    a02 = 0.0
-    a03 = 0.0
-    if h > 8:
-        a02 = min(h - 8.0, 4.0)
-    if h > 12:
-        a03 = h - 12.0
+    a01 = min(h, 8.0); a02 = 0.0; a03 = 0.0
+    if h > 8:  a02 = min(h - 8.0, 4.0)
+    if h > 12: a03 = h - 12.0
     return {"A01": a01, "A02": a02, "A03": a03}
 
 def _mode(values: List[float]) -> float:
     vals = [float(v) for v in values if pd.notna(v)]
-    if not vals:
-        return 0.0
+    if not vals: return 0.0
     c = Counter(vals)
     return max(c.items(), key=lambda kv: (kv[1], kv[0]))[0]
 
 def _safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
+    try: return float(x)
+    except Exception: return 0.0
 
-# ------------------------- core conversion -------------------------
+# -------------- core conversion --------------
 def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) -> bytes:
     xls = pd.ExcelFile(io.BytesIO(input_bytes))
     main_sheet = sheet_name or xls.sheet_names[0]
@@ -135,13 +96,13 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         raise ValueError("Input sheet is empty.")
 
     hdr = {
-        "name": ["employee", "employee name", "name", "worker", "employee_name"],
-        "date": ["date", "day", "work date", "worked date", "days"],
+        "name":  ["employee", "employee name", "name", "worker", "employee_name"],
+        "date":  ["date", "day", "work date", "worked date", "days"],
         "hours": ["hours", "hrs", "total hours", "work hours"],
-        "rate": ["rate", "pay rate", "hourly rate", "wage", "pay_rate", "salary"],
-        "dept": ["department", "dept"],
-        "ssn": ["ssn", "social", "social security"],
-        "type": ["type", "emp type", "employee type", "pay type"],
+        "rate":  ["rate", "pay rate", "hourly rate", "wage", "pay_rate", "salary"],
+        "dept":  ["department", "dept"],
+        "ssn":   ["ssn", "social", "social security"],
+        "type":  ["type", "emp type", "employee type", "pay type"],
     }
 
     def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -182,7 +143,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     if core.empty:
         raise ValueError("No valid rows after cleaning (check Employee/Date/Hours/Days).")
 
-    # Optional sheets
+    # Optional: Roster sheet
     roster = {}
     if ROSTER_SHEET_NAME in xls.sheet_names:
         try:
@@ -206,6 +167,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         except Exception:
             pass
 
+    # Optional: Piecework sheet
     piece_totals = defaultdict(lambda: defaultdict(float))  # emp -> wd -> amount
     if PIECEWORK_SHEET_NAME in xls.sheet_names:
         try:
@@ -224,23 +186,21 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         except Exception:
             pass
 
-    # Aggregate per employee/day
+    # Aggregate
     per_emp_day = core.groupby(["employee","wd"]).agg({
         "hours":"sum",
         "rate": list,
-        "dept": lambda s: next((x for x in s if str(x).strip()), ""),
-        "ssn":  lambda s: next((x for x in s if str(x).strip()), ""),
+        "dept":  lambda s: next((x for x in s if str(x).strip()), ""),
+        "ssn":   lambda s: next((x for x in s if str(x).strip()), ""),
         "wtype": lambda s: next((x for x in s if str(x).strip()), ""),
     }).reset_index()
 
-    weekly_hours = {}                                 # emp -> {A01,A02,A03}
-    daily_hours  = defaultdict(lambda: defaultdict(float))  # emp -> wd -> hrs
+    weekly_hours = {}
+    daily_hours  = defaultdict(lambda: defaultdict(float))
     emp_rates, emp_dept, emp_ssn, emp_type = defaultdict(list), {}, {}, {}
 
     for _, row in per_emp_day.iterrows():
-        emp = row["employee"]
-        wd  = int(row["wd"])
-        hrs = float(row["hours"] or 0.0)
+        emp = row["employee"]; wd = int(row["wd"]); hrs = float(row["hours"] or 0.0)
         daily_hours[emp][wd] += hrs
         dist = _apply_ca_daily_ot(hrs)
         agg = weekly_hours.get(emp, {"A01":0.0,"A02":0.0,"A03":0.0})
@@ -253,7 +213,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
 
     employees = sorted(weekly_hours.keys(), key=lambda e: (str(emp_dept.get(e,"")), e))
 
-    # Load WBS template from same folder as this file
+    # Load WBS template from repo root (since app/main.py is in app/)
     here = Path(__file__).resolve().parent
     template_path = here.parent / "wbs_template.xlsx"
     if not template_path.exists():
@@ -262,7 +222,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     wb = load_workbook(str(template_path))
     ws = wb.active
 
-    # Clear any existing data rows (keep styles)
+    # Clear existing data rows but keep styles
     max_row = ws.max_row
     if max_row >= WBS_DATA_START_ROW:
         for r in range(WBS_DATA_START_ROW, max_row+1):
@@ -288,10 +248,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         if typ not in ("H", "S"):
             typ = "S" if rate_modal >= 1000 else "H"
 
-        a01 = weekly_hours[emp]["A01"]
-        a02 = weekly_hours[emp]["A02"]
-        a03 = weekly_hours[emp]["A03"]
-
+        a01 = weekly_hours[emp]["A01"]; a02 = weekly_hours[emp]["A02"]; a03 = weekly_hours[emp]["A03"]
         ah = {i: round(float(daily_hours[emp].get(i, 0.0)), 2) for i in range(1,6)}
         ai = {i: round(float(piece_totals[emp].get(i, 0.0)), 2) for i in range(1,6)}
 
@@ -310,61 +267,48 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         for key in ("A06","A07","A08","A04","A05"):
             ws.cell(row=current_row, column=COL[key]).value = None
 
-        ws.cell(row=current_row, column=COL["AH1"]).value = ah[1] if ah[1] else None
-        ws.cell(row=current_row, column=COL["AI1"]).value = ai[1] if ai[1] else None
-        ws.cell(row=current_row, column=COL["AH2"]).value = ah[2] if ah[2] else None
-        ws.cell(row=current_row, column=COL["AI2"]).value = ai[2] if ai[2] else None
-        ws.cell(row=current_row, column=COL["AH3"]).value = ah[3] if ah[3] else None
-        ws.cell(row=current_row, column=COL["AI3"]).value = ai[3] if ai[3] else None
-        ws.cell(row=current_row, column=COL["AH4"]).value = ah[4] if ah[4] else None
-        ws.cell(row=current_row, column=COL["AI4"]).value = ai[4] if ai[4] else None
-        ws.cell(row=current_row, column=COL["AH5"]).value = ah[5] if ah[5] else None
-        ws.cell(row=current_row, column=COL["AI5"]).value = ai[5] if ai[5] else None
+        for i in range(1,6):
+            ws.cell(row=current_row, column=COL[f"AH{i}"]).value = ah[i] if ah[i] else None
+            ws.cell(row=current_row, column=COL[f"AI{i}"]).value = ai[i] if ai[i] else None
 
         ws.cell(row=current_row, column=COL["ATE"]).value = None
         ws.cell(row=current_row, column=COL["COMMENTS"]).value = None
 
         c = lambda key: get_column_letter(COL[key])
-        pr   = f"{c('PAY_RATE')}{current_row}"
-        a01c = f"{c('A01')}{current_row}"
-        a02c = f"{c('A02')}{current_row}"
-        a03c = f"{c('A03')}{current_row}"
-        ai_sum_safe = f"SUM({c('AI1')}{current_row}:{c('AI5')}{current_row})"
+        pr, a01c, a02c, a03c = (f"{c('PAY_RATE')}{current_row}", f"{c('A01')}{current_row}",
+                                f"{c('A02')}{current_row}", f"{c('A03')}{current_row}")
+        ai_sum = f"SUM({c('AI1')}{current_row}:{c('AI5')}{current_row})"
         atec = f"{c('ATE')}{current_row}"
-
         if typ == "S":
-            formula = f"IFERROR({pr} + {ai_sum_safe} + IF({atec}=\"\",0,{atec}), 0)"
+            formula = f"IFERROR({pr} + {ai_sum} + IF({atec}=\"\",0,{atec}), 0)"
         else:
-            formula = f"IFERROR(({a01c} + 1.5*{a02c} + 2*{a03c})*{pr} + {ai_sum_safe} + IF({atec}=\"\",0,{atec}), 0)"
+            formula = f"IFERROR(({a01c} + 1.5*{a02c} + 2*{a03c})*{pr} + {ai_sum} + IF({atec}=\"\",0,{atec}), 0)"
         ws.cell(row=current_row, column=COL["TOTALS"]).value = f"={formula}"
 
         current_row += 1
 
     last_data_row = current_row - 1
-
-    # Bottom totals row (SUM down)
     if last_data_row >= WBS_DATA_START_ROW:
         totals_row = current_row
         ws.cell(row=totals_row, column=COL["COMMENTS"]).value = "Totals"
-        cols_to_sum = [
-            "A01","A02","A03","A06","A07","A08","A04","A05",
-            "AH1","AI1","AH2","AI2","AH3","AI3","AH4","AI4","AH5","AI5",
-            "ATE","TOTALS"
-        ]
-        for key in cols_to_sum:
-            col_letter = get_column_letter(COL[key])
-            ws.cell(row=totals_row, column=COL[key]).value = f"=SUM({col_letter}{WBS_DATA_START_ROW}:{col_letter}{last_data_row})"
+        for key in ["A01","A02","A03","A06","A07","A08","A04","A05",
+                    "AH1","AI1","AH2","AI2","AH3","AI3","AH4","AI4","AH5","AI5","ATE","TOTALS"]:
+            col = get_column_letter(COL[key])
+            ws.cell(row=totals_row, column=COL[key]).value = f"=SUM({col}{WBS_DATA_START_ROW}:{col}{last_data_row})"
 
-    # stream result
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
     return out.read()
 
-# ------------------------- routes -------------------------
+# --------------- routes ---------------
 @app.get("/health")
 def health():
     return JSONResponse({"ok": True, "ts": datetime.utcnow().isoformat() + "Z"})
+
+def _ext_ok(filename: str) -> bool:
+    fn = (filename or "").lower()
+    return any(fn.endswith(e) for e in ALLOWED_EXTS)
 
 @app.post("/process-payroll")
 async def process_payroll(file: UploadFile = File(...)):
@@ -382,6 +326,12 @@ async def process_payroll(file: UploadFile = File(...)):
             headers={"Content-Disposition": f'attachment; filename="{out_name}"'}
         )
     except ValueError as ve:
+        # show precise validation failures to frontend and logs
+        import traceback, sys
+        traceback.print_exc(file=sys.stderr)
         raise HTTPException(status_code=422, detail=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+        # print full traceback to Railway logs and surface message
+        import traceback, sys
+        traceback.print_exc(file=sys.stderr)
+        raise HTTPException(status_code=500, detail=f"backend processing failed: {e}")
