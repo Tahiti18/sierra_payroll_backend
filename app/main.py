@@ -1,7 +1,7 @@
 # server/main.py
 import io
 from datetime import datetime, date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -9,15 +9,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse, JSONResponse
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 
 # ------------------------------------------------------------------------------
-# App + CORS (adjust allow_origins to your frontend domain if needed)
+# App + CORS
 # ------------------------------------------------------------------------------
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="1.0.0")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten to your Netlify domain if desired
+    allow_origins=["*"],  # tighten to your Netlify origin if desired
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -26,25 +27,26 @@ app.add_middleware(
 ALLOWED_EXTS = (".xlsx", ".xls")
 
 # ------------------------------------------------------------------------------
-# Helpers (no fuzzy math; only mild header matching — numbers remain exact)
+# Helpers (header matching only; numbers remain exact)
 # ------------------------------------------------------------------------------
 def _ext_ok(filename: str) -> bool:
     name = (filename or "").lower()
     return any(name.endswith(e) for e in ALLOWED_EXTS)
 
-def _std_col(s: str) -> str:
+def _std(s: str) -> str:
     return (s or "").strip().lower().replace("\n", " ").replace("\r", " ")
 
 def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    cols = { _std_col(c): c for c in df.columns }
+    cols_map = { _std(c): c for c in df.columns }
+    # exact
     for want in candidates:
-        key = _std_col(want)
-        if key in cols:
-            return cols[key]
+        key = _std(want)
+        if key in cols_map:
+            return cols_map[key]
     # relaxed contains (headers only)
     for want in candidates:
-        key = _std_col(want)
-        for k, v in cols.items():
+        key = _std(want)
+        for k, v in cols_map.items():
             if key in k:
                 return v
     return None
@@ -62,12 +64,16 @@ def _require_columns(df: pd.DataFrame, mapping: Dict[str, List[str]]) -> Dict[st
     return resolved
 
 def _normalize_name(raw: str) -> str:
-    if not raw or not isinstance(raw, str):
-        return ""
+    if not isinstance(raw, str):
+        raw = "" if pd.isna(raw) else str(raw)
     name = raw.strip()
+    if not name:
+        return ""
     parts = [p for p in name.split() if p]
+    # If already "Last, First", keep as-is
+    if len(parts) >= 2 and "," in name:
+        return name
     if len(parts) == 2:
-        # "First Last" -> "Last, First"
         return f"{parts[1]}, {parts[0]}"
     return name
 
@@ -81,12 +87,22 @@ def _to_date(val) -> Optional[date]:
     except Exception:
         return None
 
+def _money(x) -> float:
+    return float(x or 0.0)
+
+def _employee_key(ssn: str, name: str) -> Tuple[str, str]:
+    """Canonical key preference: SSN (trimmed) else normalized name."""
+    s = (ssn or "").strip()
+    if s:
+        return ("SSN", s)
+    return ("NAME", _normalize_name(name))
+
 def _apply_ca_daily_ot(day_hours: float) -> Dict[str, float]:
     """
     California daily OT:
-      - first 8: REG
-      - next 4 (8–12): OT
-      - >12: DT
+      - First 8 → REG
+      - Next 4 (8–12) → OT
+      - >12 → DT
     """
     h = float(day_hours or 0.0)
     reg = min(h, 8.0)
@@ -98,12 +114,8 @@ def _apply_ca_daily_ot(day_hours: float) -> Dict[str, float]:
         dt = h - 12.0
     return {"REG": reg, "OT": ot, "DT": dt}
 
-def _money(x: float) -> float:
-    # keep exact math; only round at Excel write
-    return float(x or 0.0)
-
 # ------------------------------------------------------------------------------
-# Core conversion
+# Core conversion to EXACT WBS layout
 # ------------------------------------------------------------------------------
 def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) -> bytes:
     excel = pd.ExcelFile(io.BytesIO(input_bytes))
@@ -113,17 +125,18 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     if df.empty:
         raise ValueError("Input sheet is empty.")
 
+    # Expected inputs from Sierra (we accept common variants)
     required = {
         "employee": ["employee", "employee name", "name", "worker", "employee_name"],
         "date": ["date", "work date", "day", "worked date"],
         "hours": ["hours", "hrs", "total hours", "work hours"],
-        "rate": ["rate", "pay rate", "hourly rate", "wage"],
+        "rate": ["rate", "pay rate", "hourly rate", "wage", "pay_rate"],
     }
     optional = {
         "department": ["department", "dept", "division"],
         "ssn": ["ssn", "social", "social security", "social security number"],
-        "wtype": ["type", "employee type", "emp type", "pay type"],
-        "task": ["task", "earn type", "earning", "code"],
+        "wtype": ["type", "employee type", "emp type", "pay type", "wbs type"],
+        "task": ["task", "earn type", "earning", "code", "earn code"],
     }
 
     resolved_req = _require_columns(df, required)
@@ -138,33 +151,51 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     core["wtype"]      = df[resolved_opt["wtype"]] if resolved_opt["wtype"] else ""
     core["task"]       = df[resolved_opt["task"]] if resolved_opt["task"] else ""
 
-    # Normalize types
+    # Normalize
     core["employee"] = core["employee"].astype(str).map(_normalize_name)
     core["date"]     = core["date"].map(_to_date)
     core["hours"]    = pd.to_numeric(core["hours"], errors="coerce").fillna(0.0).astype(float)
     core["rate"]     = pd.to_numeric(core["rate"], errors="coerce").fillna(0.0).astype(float)
 
-    # Keep only valid rows
+    # Valid rows only
     core = core[(core["employee"].str.len() > 0) & core["date"].notna() & (core["hours"] > 0)]
 
-    # Sum per employee/day, then apply CA daily OT split
-    day_group = core.groupby(["employee", "date", "rate"], dropna=False)["hours"].sum().reset_index()
+    if core.empty:
+        raise ValueError("No valid rows after cleaning (check Employee/Date/Hours).")
 
+    # Per-employee/day sum first (handles duplicates in source)
+    day_group = (
+        core.groupby(["employee", "ssn", "department", "wtype", "rate", "date"], dropna=False)["hours"]
+            .sum()
+            .reset_index()
+    )
+
+    # Apply CA daily split, then weekly roll-up
     split_rows = []
     for _, row in day_group.iterrows():
         dist = _apply_ca_daily_ot(float(row["hours"]))
         split_rows.append({
             "employee": row["employee"],
-            "date": row["date"],
+            "ssn": (row["ssn"] or ""),
+            "department": (row["department"] or ""),
+            "wtype": (row["wtype"] or ""),
             "rate": float(row["rate"]),
+            "date": row["date"],
             "REG": dist["REG"],
             "OT": dist["OT"],
             "DT": dist["DT"],
         })
     split_df = pd.DataFrame(split_rows)
 
-    # Weekly totals by employee
-    weekly = split_df.groupby(["employee", "rate"], dropna=False)[["REG", "OT", "DT"]].sum().reset_index()
+    # Canonical employee key (SSN preferred)
+    split_df["emp_key_type"], split_df["emp_key_val"] = zip(*split_df.apply(lambda r: _employee_key(r["ssn"], r["employee"]), axis=1))
+
+    # Weekly roll-up *by employee* (sum all days in file)
+    weekly = (
+        split_df.groupby(["emp_key_type", "emp_key_val", "employee", "ssn", "department", "wtype", "rate"], dropna=False)[["REG", "OT", "DT"]]
+            .sum()
+            .reset_index()
+    )
 
     # Dollars
     weekly["REG_$"]   = weekly["REG"] * weekly["rate"]
@@ -172,20 +203,12 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     weekly["DT_$"]    = weekly["DT"]  * weekly["rate"] * 2.0
     weekly["TOTAL_$"] = weekly["REG_$"] + weekly["OT_$"] + weekly["DT_$"]
 
-    # Bring over identity columns (first non-null seen)
-    id_map = (
-        core.groupby("employee")
-            .agg({"department": "first", "ssn": "first", "wtype": "first"})
-            .reset_index()
-    )
-    out = pd.merge(weekly, id_map, on="employee", how="left")
-
     # WBS identity defaults
-    out["Status"] = "A"
-    out["Type"] = out["wtype"].astype(str).str.upper().map(lambda x: "S" if x.startswith("S") else "H")
+    weekly["Status"] = "A"
+    weekly["Type"] = weekly["wtype"].astype(str).str.upper().map(lambda x: "S" if x.startswith("S") else "H")
 
     # Final WBS column order
-    wbs_cols = [
+    out_cols = [
         "Status",            # A
         "Type",              # H/S
         "employee",          # Last, First
@@ -200,19 +223,48 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         "DT_$",
         "TOTAL_$",
     ]
-    out = out[wbs_cols].copy()
+    out = weekly[out_cols].copy()
 
-    # Build Excel in-memory
+    # Sort for stable, readable output (by Department then Employee)
+    out["department_sort"] = out["department"].astype(str)
+    out.sort_values(by=["department_sort", "employee"], inplace=True)
+    out.drop(columns=["department_sort"], inplace=True)
+
+    # Build Excel in-memory — EXACT WBS layout
     wb = Workbook()
     ws = wb.active
     ws.title = "WEEKLY"
 
-    header1 = ["", "", "WEEKLY PAYROLL", "", "", "", "", "", "", "", "", "", ""]
-    header2 = ["Status", "Type", "Employee", "SSN", "Department", "Pay Rate",
-               "REG (A01)", "OT (A02)", "DT (A03)", "REG $", "OT $", "DT $", "TOTAL $"]
-    ws.append(header1)
-    ws.append(header2)
+    # Title row + header row
+    title_row = ["", "", "WEEKLY PAYROLL", "", "", "", "", "", "", "", "", "", ""]
+    headers   = ["Status", "Type", "Employee", "SSN", "Department", "Pay Rate",
+                 "REG (A01)", "OT (A02)", "DT (A03)", "REG $", "OT $", "DT $", "TOTAL $"]
 
+    ws.append(title_row)
+    ws.append(headers)
+
+    # Styles
+    title_font = Font(bold=True, size=14)
+    header_font = Font(bold=True)
+    center = Alignment(horizontal="center", vertical="center")
+    right = Alignment(horizontal="right")
+    thin = Side(border_style="thin", color="DDDDDD")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_fill = PatternFill(start_color="F3F4F6", end_color="F3F4F6", fill_type="solid")
+
+    # Apply title style
+    ws["C1"].font = title_font
+    ws["C1"].alignment = center
+
+    # Apply header styles
+    for col_idx in range(1, 14):
+        cell = ws.cell(row=2, column=col_idx)
+        cell.font = header_font
+        cell.alignment = center
+        cell.fill = header_fill
+        cell.border = border
+
+    # Data rows
     for _, r in out.iterrows():
         ws.append([
             r["Status"],
@@ -230,15 +282,54 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
             round(_money(r["TOTAL_$"]), 2),
         ])
 
-    # Nice widths
-    for col_idx in range(1, 14):
-        col = get_column_letter(col_idx)
-        max_len = 12
-        for cell in ws[col]:
-            if cell.value is None:
-                continue
-            max_len = max(max_len, len(str(cell.value)))
-        ws.column_dimensions[col].width = min(max_len + 2, 30)
+    first_data_row = 3
+    last_data_row = ws.max_row
+
+    # Grand Totals row
+    if last_data_row >= first_data_row:
+        ws.append(["", "", "GRAND TOTALS", "", "", ""] +
+                  [f"=SUM({get_column_letter(c)}{first_data_row}:{get_column_letter(c)}{last_data_row})"
+                   for c in range(7, 14)])
+        total_row = ws.max_row
+
+        # Style totals row
+        for col_idx in range(1, 14):
+            cell = ws.cell(row=total_row, column=col_idx)
+            cell.font = Font(bold=True)
+            cell.border = border
+            if col_idx >= 7:
+                cell.alignment = right
+
+    # Column widths
+    widths = {
+        1: 8,   # Status
+        2: 8,   # Type
+        3: 26,  # Employee
+        4: 16,  # SSN
+        5: 18,  # Department
+        6: 12,  # Pay Rate
+        7: 12,  # REG
+        8: 12,  # OT
+        9: 12,  # DT
+        10: 12, # REG $
+        11: 12, # OT $
+        12: 12, # DT $
+        13: 12, # TOTAL $
+    }
+    for col_idx, w in widths.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = w
+
+    # Number formats (currency for $ columns, 2 decimals for hours/rate)
+    for row in ws.iter_rows(min_row=3, max_row=ws.max_row, min_col=1, max_col=13):
+        for idx, cell in enumerate(row, start=1):
+            cell.border = border
+            if idx in (6, 7, 8, 9):   # rate + hours
+                cell.number_format = '0.00'
+                if idx >= 7:
+                    cell.alignment = right
+            elif idx in (10, 11, 12, 13):  # currency
+                cell.number_format = '"$"#,##0.00'
+                cell.alignment = right
 
     # Return bytes
     bio = io.BytesIO()
@@ -263,7 +354,9 @@ async def process_payroll(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         out_bytes = convert_sierra_to_wbs(contents, sheet_name=None)
-        out_name = f"WBS_Payroll_{datetime.utcnow().date().isoformat()}.xlsx"
+        # File name in WBS style
+        today = datetime.utcnow().date()
+        out_name = f"WBS Payroll {today.strftime('%Y-%m-%d')}.xlsx"
         return StreamingResponse(
             io.BytesIO(out_bytes),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
