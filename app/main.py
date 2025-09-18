@@ -12,16 +12,13 @@ from starlette.responses import StreamingResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-# ------------------------------------------------------------------------------
-# App + CORS
-# ------------------------------------------------------------------------------
 DEBUG = True
 
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="1.0.0")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="1.0.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    # tighten later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,21 +26,20 @@ app.add_middleware(
 
 ALLOWED_EXTS = (".xlsx", ".xls")
 
-# Template file is in the **repo root** (beside Dockerfile, requirements.txt)
-# and NOT in app/ — so from app/main.py we must go up one level.
+# IMPORTANT: template lives in repo root, not in app/
 TEMPLATE_PATH = (Path(__file__).resolve().parents[1] / "wbs_template.xlsx")
 
-# WBS sheet name and where data starts
 WBS_SHEET_NAME = "WEEKLY"
-WBS_DATA_START_ROW = 9  # header rows 1–8, names start at row 9 in your template
+WBS_DATA_START_ROW = 9  # employees start at row 9 in your template
 
-# Column indexes in the template (1-based)
+# Column indexes (1-based) as they are in your template
 COL = {
     "SSN": 1,           # A
     "EMP": 2,           # B
     "STATUS": 3,        # C
     "TYPE": 4,          # D
-    "PAY_RATE": 6,      # F (E is "Pay" heading cell merged above)
+    # Col E is just the "Pay" header group. Rate actually in F.
+    "PAY_RATE": 6,      # F
     "DEPT": 7,          # G
     "A01": 8,           # REGULAR
     "A02": 9,           # OVERTIME
@@ -51,13 +47,11 @@ COL = {
     "A06": 11,          # VACATION
     "A07": 12,          # SICK
     "A08": 13,          # HOLIDAY
-    # BONUS/COMM etc. are to the right; totals live far right and are formula-driven in template.
-    "TOTALS": 54,       # keep this large so we never touch totals/formula area on the right
+    # Safe boundary for cells we control; totals/formulas live far to the right
+    "TOTALS": 54,
 }
 
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
+# ------------------------ helpers ------------------------
 def _ext_ok(filename: str) -> bool:
     name = (filename or "").lower()
     return any(name.endswith(e) for e in ALLOWED_EXTS)
@@ -110,7 +104,6 @@ def _to_date(val) -> Optional[date]:
         return None
 
 def _apply_ca_daily_ot(day_hours: float) -> Dict[str, float]:
-    """CA daily OT: first 8 REG, next 4 OT, >12 DT."""
     h = float(day_hours or 0.0)
     reg = min(h, 8.0)
     ot = max(0.0, min(h - 8.0, 4.0))
@@ -120,9 +113,7 @@ def _apply_ca_daily_ot(day_hours: float) -> Dict[str, float]:
 def _money(x: float) -> float:
     return float(x or 0.0)
 
-# ------------------------------------------------------------------------------
-# Core conversion (same logic as before, but template path + safe clearing fixed)
-# ------------------------------------------------------------------------------
+# ------------------------ core ------------------------
 def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) -> bytes:
     # 1) Read input
     try:
@@ -196,7 +187,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     out["Status"] = "A"
     out["Type"] = out["wtype"].astype(str).str.upper().map(lambda x: "S" if x.startswith("S") else "H")
 
-    # 4) Open WBS template from repo root
+    # 4) Open template
     if not TEMPLATE_PATH.exists():
         raise ValueError(f"WBS template not found at {TEMPLATE_PATH}")
 
@@ -205,36 +196,32 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         raise ValueError(f"WBS sheet '{WBS_SHEET_NAME}' not found in template.")
     ws = wb[WBS_SHEET_NAME]
 
-    # 5) Clear previous data rows (but keep formatting & formulas)
+    # 4a) **Unmerge** any merged ranges that intersect the data rows we write,
+    # so writes to C/D/etc. are not blocked by openpyxl "MergedCell is read-only".
+    to_unmerge = []
+    for rng in ws.merged_cells.ranges:
+        if rng.max_row >= WBS_DATA_START_ROW and rng.min_col <= COL["TOTALS"]:
+            to_unmerge.append(str(rng))
+    for addr in to_unmerge:
+        ws.unmerge_cells(addr)
+
+    # 5) Clear prior data rows but keep formatting/formulas
     max_row = ws.max_row
     if max_row >= WBS_DATA_START_ROW:
         for r in range(WBS_DATA_START_ROW, max_row + 1):
-            # If row already blank up to our safe write boundary, skip
+            # If already blank up to our safe boundary, skip
             blank = True
             for c in range(1, COL["TOTALS"] + 1):
-                try:
-                    val = ws.cell(row=r, column=c).value
-                except Exception:
-                    # merged read-only cell — treat as blank for our purposes
-                    val = None
+                val = ws.cell(row=r, column=c).value
                 if val not in (None, ""):
                     blank = False
                     break
             if blank:
                 continue
-
-            # Now blank only the cells we own (do NOT touch totals/formulas on the far right)
             for c in range(1, COL["TOTALS"] + 1):
-                try:
-                    cell = ws.cell(row=r, column=c)
-                    # do not nuke header labels in col C2.. etc.; we start at data rows only
-                    cell.value = None
-                except Exception:
-                    # merged cell (read-only) — skip
-                    continue
+                ws.cell(row=r, column=c).value = None
 
     # 6) Write rows
-    # Sorted by Dept then Name (stable)
     out["department"] = out["department"].fillna("")
     employees = sorted(
         out.to_dict("records"),
@@ -254,7 +241,6 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         ot  = float(emp.get("OT")  or 0.0)
         dt  = float(emp.get("DT")  or 0.0)
 
-        # Write columns (never write beyond COL["TOTALS"])
         ws.cell(row=current_row, column=COL["SSN"]).value = ssn
         ws.cell(row=current_row, column=COL["EMP"]).value = name
         ws.cell(row=current_row, column=COL["STATUS"]).value = status
@@ -271,29 +257,24 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
 
         current_row += 1
 
-    # 7) Autosize (only for area we touched)
+    # 7) Autosize area we touched
     for col_idx in range(1, COL["A08"] + 1):
         col_letter = get_column_letter(col_idx)
         max_len = 8
         for r in range(1, current_row):
-            try:
-                val = ws[f"{col_letter}{r}"].value
-            except Exception:
-                val = None
+            val = ws[f"{col_letter}{r}"].value
             if val is None:
                 continue
             max_len = max(max_len, len(str(val)))
         ws.column_dimensions[col_letter].width = min(max_len + 2, 30)
 
-    # 8) Return workbook bytes
+    # 8) Return bytes
     out_bio = io.BytesIO()
     wb.save(out_bio)
     out_bio.seek(0)
     return out_bio.read()
 
-# ------------------------------------------------------------------------------
-# Routes
-# ------------------------------------------------------------------------------
+# ------------------------ routes ------------------------
 @app.get("/health")
 def health():
     return JSONResponse({"ok": True, "ts": datetime.utcnow().isoformat() + "Z"})
@@ -315,27 +296,22 @@ async def process_payroll(file: UploadFile = File(...)):
             headers={"Content-Disposition": f'attachment; filename="{out_name}"'}
         )
     except ValueError as ve:
-        # data/schema problems → 422 with message
         if DEBUG:
             print("ValueError while processing payroll:\n" + traceback.format_exc())
         raise HTTPException(status_code=422, detail=str(ve))
     except Exception:
-        # hard 500 with full traceback to logs
         tb = traceback.format_exc()
         print("Unhandled server error:\n" + tb)
         msg = "Server error: backend processing failed"
         if DEBUG:
-            # Include a short hint in the HTTP body so you know to open logs
             msg += " (see Railway Deploy Logs for traceback)"
         raise HTTPException(status_code=500, detail=msg)
 
-# Optional: quick debug to inspect sheet names/columns of uploaded file
 @app.post("/debug/inspect")
 async def debug_inspect(file: UploadFile = File(...)):
     contents = await file.read()
     try:
         xl = pd.ExcelFile(io.BytesIO(contents))
-        # peek first sheet headings
         df = xl.parse(xl.sheet_names[0])
         cols = list(df.columns.astype(str))
         return JSONResponse({"sheets": xl.sheet_names, "first_sheet_columns": cols})
