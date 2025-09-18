@@ -307,7 +307,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
 
     # Load WBS template (fresh each request; never saved back)
 here = Path(__file__).resolve().parent
-template_path = here / "wbs_template.xlsx"  # template is in the same folder as main.py
+template_path = here.parent / "wbs_template.xlsx"  # template is in the same folder as main.py
 if not template_path.exists():
     raise HTTPException(status_code=500, detail=f"WBS template not found at {template_path}")
 
