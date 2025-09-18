@@ -1,470 +1,255 @@
-# server/main.py
-import io, os, re, unicodedata
-from pathlib import Path
-from datetime import datetime, date
-from typing import Optional, List, Dict, Tuple
-
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import StreamingResponse, JSONResponse
-from openpyxl import load_workbook
-from openpyxl.worksheet.worksheet import Worksheet
-
-app = FastAPI(title="Sierra → WBS (weekly-40, numbers-first)", version="9.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-BASE_DIR = Path(__file__).resolve().parents[1]
-SEARCH_DIRS = [BASE_DIR, BASE_DIR / "app", BASE_DIR / "server", BASE_DIR / "app" / "data"]
-ALLOWED_EXTS = (".xlsx", ".xls")
-
-# ---------- helpers ----------
-def _std(s: str) -> str:
-    return (s or "").strip().lower().replace("\n", " ").replace("\r", " ")
-
-def _ext_ok(name: str) -> bool:
-    n = (name or "").lower()
-    return any(n.endswith(e) for e in ALLOWED_EXTS)
-
-def _clean_space(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s).strip())
-
-def _canon_name(s: str) -> str:
-    s = _clean_space(s)
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.replace(".", "")
-    s = re.sub(r"\s*,\s*", ",", s)
-    return s.lower()
-
-def _to_number(x) -> float:
-    if x is None or (isinstance(x, float) and pd.isna(x)): return 0.0
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan", "none"): return 0.0
-    s = re.sub(r"[^0-9\.\-]", "", s)
-    try:
-        return float(s) if s not in ("", "-", ".", "-.") else 0.0
-    except Exception:
-        try: return float(x)
-        except Exception: return 0.0
-
-def _money(x: float) -> float:
-    try: return round(float(x or 0.0), 2)
-    except Exception: return 0.0
-
-def _find_file(basenames: List[str]) -> Optional[Path]:
-    env_map = {"wbs_template.xlsx": "WBS_TEMPLATE_PATH", "roster.xlsx": "ROSTER_PATH", "roster.csv": "ROSTER_PATH"}
-    for name in basenames:
-        env_key = env_map.get(name)
-        if env_key:
-            p = os.getenv(env_key)
-            if p and Path(p).exists():
-                return Path(p)
-    for d in SEARCH_DIRS:
-        for name in basenames:
-            p = d / name
-            if p.exists():
-                return p
-    return None
-
-def _load_template_bytes() -> bytes:
-    p = _find_file(["wbs_template.xlsx"])
-    if not p:
-        raise HTTPException(422, "WBS template not found. Place 'wbs_template.xlsx' at repo root or set WBS_TEMPLATE_PATH.")
-    return p.read_bytes()
-
-def _load_roster_df() -> Optional[pd.DataFrame]:
-    p = _find_file(["roster.xlsx", "roster.csv"])
-    if not p: return None
-    try:
-        if p.suffix.lower() == ".xlsx":
-            df = pd.read_excel(p, dtype=str)
-        else:
-            df = pd.read_csv(p, dtype=str)
-    except Exception as e:
-        raise HTTPException(422, f"Roster load failed: {e}")
-    if df.empty: return None
-
-    def find_col(options: List[str]) -> Optional[str]:
-        norm = {_std(c): c for c in df.columns}
-        for want in options:
-            w = _std(want)
-            if w in norm: return norm[w]
-        for want in options:
-            w = _std(want)
-            for k, c in norm.items():
-                if w in k: return c
-        return None
-
-    name_col = find_col(["employee name", "employee", "name"])
-    ssn_col  = find_col(["ssn", "social", "social security"])
-    rate_col = find_col(["payrate", "rate", "hourly rate", "wage"])
-    dept_col = find_col(["dept", "department", "division"])
-    type_col = find_col(["type", "employee type", "emp type"])
-
-    if not name_col: return None
-
-    out = pd.DataFrame({
-        "employee_disp": df[name_col].astype(str).map(_clean_space),
-        "employee_key":  df[name_col].astype(str).map(_canon_name),
-        "ssn":           (df[ssn_col].astype(str).map(str.strip) if ssn_col else pd.Series([""]*len(df))),
-        "rate_roster":   pd.to_numeric(df[rate_col].map(_to_number), errors="coerce") if rate_col else pd.Series([None]*len(df)),
-        "department_roster": df[dept_col].astype(str).map(str.strip) if dept_col else pd.Series([""]*len(df)),
-        "wtype_roster":      df[type_col].astype(str).map(str.strip) if type_col else pd.Series([""]*len(df)),
-    }).dropna(subset=["employee_key"]).drop_duplicates(subset=["employee_key"], keep="last")
-
-    return out
-
-# ---------- Sierra parsing (weekly-40) ----------
-COMMON_EMP  = ["employee", "employee name", "name"]
-COMMON_DATE = ["date", "work date", "day"]
-COMMON_HRS  = ["hours", "hrs", "total hours", "a01", "regular", "reg"]
-COMMON_RATE = ["rate", "pay rate", "hourly rate", "wage", "base rate"]
-
-def _guess_col(df: pd.DataFrame, options: List[str]) -> Optional[str]:
-    norm = {_std(c): c for c in df.columns}
-    for want in options:
-        w = _std(want)
-        if w in norm: return norm[w]
-    for want in options:
-        w = _std(want)
-        for k, c in norm.items():
-            if w in k: return c
-    return None
-
-def _guess_employee_col(df: pd.DataFrame) -> Optional[str]:
-    c = _guess_col(df, COMMON_EMP)
-    if c: return c
-    best, score = None, -1
-    for col in df.columns:
-        s = df[col].astype(str)
-        looks = s.str.contains(r"[A-Za-z],\s*[A-Za-z]", regex=True, na=False).mean()
-        if looks > score:
-            best, score = col, looks
-    return best if score >= 0.2 else None
-
-def _guess_date_col(df: pd.DataFrame) -> Optional[str]:
-    c = _guess_col(df, COMMON_DATE)
-    if c: return c
-    best, score = None, -1
-    for col in df.columns:
-        try:
-            sc = pd.to_datetime(df[col], errors="coerce").notna().mean()
-            if sc > score:
-                score, best = sc, col
-        except Exception:
-            continue
-    return best if score >= 0.3 else None
-
-def _guess_hours_col(df: pd.DataFrame) -> Optional[str]:
-    c = _guess_col(df, COMMON_HRS)
-    if c: return c
-    best, score = None, -1
-    for col in df.columns:
-        try:
-            v = pd.to_numeric(df[col].map(_to_number), errors="coerce")
-        except Exception:
-            continue
-        ok = v.between(0, 24, inclusive="both").mean()
-        nz = (v > 0).mean()
-        sc = ok * 0.6 + nz * 0.4
-        if sc > score:
-            best, score = col, sc
-    return best if score >= 0.3 else None
-
-def _weekly40(hours_total: float) -> Dict[str, float]:
-    h = float(hours_total or 0.0)
-    reg = min(h, 40.0)
-    ot  = max(h - 40.0, 0.0)
-    dt  = 0.0
-    return {"REG": reg, "OT": ot, "DT": dt}
-
-def build_weekly_from_sierra(xlsx_bytes: bytes) -> pd.DataFrame:
-    excel = pd.ExcelFile(io.BytesIO(xlsx_bytes))
-    sheet = excel.sheet_names[0]
-    df = excel.parse(sheet)
-
-    roster = _load_roster_df()
-    rate_map = { } ; ssn_map = { } ; dept_map = { } ; type_map = { }
-    if roster is not None and not roster.empty:
-        rate_map = {k: float(v) for k, v in zip(roster["employee_key"], roster["rate_roster"]) if pd.notna(v)}
-        ssn_map  = {k: (s or "") for k, s in zip(roster["employee_key"], roster["ssn"])}
-        dept_map = {k: (d or "") for k, d in zip(roster["employee_key"], roster["department_roster"])}
-        type_map = {k: (t or "") for k, t in zip(roster["employee_key"], roster["wtype_roster"])}
-
-    emp_col  = _guess_employee_col(df)
-    if not emp_col:
-        raise ValueError("Could not find 'Employee' column in Sierra file.")
-    rate_col = _guess_col(df, COMMON_RATE)  # optional
-    dep_col  = _guess_col(df, ["department","dept","division"])
-    typ_col  = _guess_col(df, ["type","employee type","emp type","pay type"])
-
-    employee = df[emp_col].astype(str).map(_clean_space)
-    emp_key  = employee.map(_canon_name)
-    raw_rate = df[rate_col].map(_to_number) if rate_col else pd.Series([0.0]*len(df))
-    rate = []
-    for k, r in zip(emp_key, raw_rate):
-        v = float(r or 0.0)
-        if v <= 0 and k in rate_map: v = float(rate_map[k] or 0.0)
-        rate.append(v)
-    rate = pd.Series(rate, dtype=float)
-
-    base = pd.DataFrame({
-        "employee":   employee,
-        "emp_key":    emp_key,
-        "rate":       rate.astype(float),
-        "department": (df[dep_col].astype(str).map(str.strip) if dep_col else ""),
-        "wtype":      (df[typ_col].astype(str).map(str.strip) if typ_col else ""),
-    })
-
-    date_col = _guess_date_col(df)
-    hrs_col  = _guess_hours_col(df)
-    has_date_hours = bool(date_col and hrs_col)
-
-    day_candidates = [
-        ("mon", ["mon","monday"]),("tue", ["tue","tues","tuesday"]),("wed", ["wed","weds","wednesday"]),
-        ("thu", ["thu","thur","thurs","thursday"]),("fri", ["fri","friday"]),("sat", ["sat","saturday"]),("sun", ["sun","sunday"]),
-    ]
-    day_cols: Dict[str,str] = {}
-    normcols = { _std(c): c for c in df.columns }
-    for day_key, aliases in day_candidates:
-        for alias in aliases:
-            for k,c in normcols.items():
-                if alias in k:
-                    day_cols[day_key] = c
-                    break
-            if day_key in day_cols: break
-    has_weekdays = len(day_cols) >= 4
-
-    if not has_date_hours and not has_weekdays:
-        raise ValueError("Could not find Date+Hours or weekday (Mon..Sun) columns in Sierra file.")
-
-    if has_date_hours:
-        rows = pd.DataFrame({
-            "emp_key":    base["emp_key"],
-            "employee":   base["employee"],
-            "hours":      pd.to_numeric(df[hrs_col].map(_to_number), errors="coerce").fillna(0.0).astype(float),
-            "rate":       base["rate"],
-            "department": base["department"],
-            "wtype":      base["wtype"],
-        })
-    else:
-        hrs_sum = pd.Series([0.0]*len(df), dtype=float)
-        for _, col in day_cols.items():
-            hrs_sum = hrs_sum + pd.to_numeric(df[col].map(_to_number), errors="coerce").fillna(0.0).astype(float)
-        rows = pd.DataFrame({
-            "emp_key":    base["emp_key"],
-            "employee":   base["employee"],
-            "hours":      hrs_sum,
-            "rate":       base["rate"],
-            "department": base["department"],
-            "wtype":      base["wtype"],
-        })
-
-    by_emp = rows.groupby(["emp_key","employee"], as_index=False).agg(
-        HOURS=("hours","sum"),
-        RATE=("rate","max"),
-        DEPARTMENT=("department","first"),
-        WTYPE=("wtype","first"),
-    )
-
-    b = by_emp["HOURS"].map(_weekly40)
-    by_emp["REG"] = b.map(lambda d: d["REG"]).astype(float)
-    by_emp["OT"]  = b.map(lambda d: d["OT"]).astype(float)
-    by_emp["DT"]  = 0.0
-
-    def _final_rate(row):
-        rr = float(row["RATE"] or 0.0)
-        if rr <= 0.0: return float(rate_map.get(row["emp_key"], 0.0))
-        return rr
-    by_emp["rate"] = by_emp.apply(_final_rate, axis=1).astype(float)
-
-    by_emp["REG_$"]   = by_emp["REG"] * by_emp["rate"]
-    by_emp["OT_$"]    = by_emp["OT"]  * by_emp["rate"] * 1.5
-    by_emp["DT_$"]    = by_emp["DT"]  * by_emp["rate"] * 2.0
-    by_emp["TOTAL_$"] = by_emp["REG_$"] + by_emp["OT_$"] + by_emp["DT_$"]
-
-    weekly = pd.DataFrame({
-        "emp_key":    by_emp["emp_key"],
-        "employee":   by_emp["employee"],
-        "ssn":        by_emp["emp_key"].map(lambda k: ssn_map.get(k, "") if ssn_map else ""),
-        "Status":     "A",
-        "Type":       by_emp["WTYPE"].map(lambda s: "S" if str(s).upper().startswith("S") else "H"),
-        "rate":       by_emp["rate"].map(_money),
-        "department": by_emp["DEPARTMENT"].astype(str),
-        "REG":        by_emp["REG"].map(_money),
-        "OT":         by_emp["OT"].map(_money),
-        "DT":         by_emp["DT"].map(_money),
-        "REG_$":      by_emp["REG_$"].map(_money),
-        "OT_$":       by_emp["OT_$"].map(_money),
-        "DT_$":       by_emp["DT_$"].map(_money),
-        "TOTAL_$":    by_emp["TOTAL_$"].map(_money),
-    })
-
-    weekly["ssn"] = weekly["ssn"].fillna("").astype(str)
-    weekly = weekly.drop(columns=["emp_key"])
-    return weekly
-
-# ---------- WBS template write (WEEKLY only) ----------
-def _find_wbs_header(ws: Worksheet) -> Tuple[int, Dict[str, int]]:
-    req_aliases = {
-        "ssn": ["ssn"],
-        "name": ["employee name","employee","name"],
-        "status":["status"],
-        "type": ["type"],
-        "rate": ["pay rate","payrate","rate"],
-        "dept": ["dept","department"],
-        "a01": ["a01","regular","reg"],
-        "a02": ["a02","overtime","ot"],
-        "a03": ["a03","doubletime","dt"],
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Sierra → WBS Payroll (One-Click)</title>
+  <style>
+    :root{
+      --bg:#0b1220; --card:#0f172a; --txt:#e2e8f0; --muted:#94a3b8;
+      --border:#334155; --primary:#3b82f6; --accent:#0ea5e9;
+      --ok:#10b981; --warn:#f59e0b; --err:#ef4444;
+      --chip:#1f2937; --zone:#0b1020;
     }
-    opt_aliases = {
-        "reg_amt":     ["a01 $","a01$","reg $","regular $","regular amt","a01 amount"],
-        "ot_amt":      ["a02 $","a02$","ot $","overtime $","overtime amt","a02 amount"],
-        "dt_amt":      ["a03 $","a03$","dt $","doubletime $","doubletime amt","a03 amount"],
-        "total_amt":   ["total $","total$","grand total $"],
-        "total_plain": ["total","totals"],
+    *{box-sizing:border-box}
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt)}
+    a{color:var(--accent);text-decoration:none}
+    .wrap{max-width:980px;margin:36px auto;padding:20px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:16px}
+    h1{margin:0 0 6px;font-size:22px}
+    p{margin:0 0 14px;color:var(--muted)}
+    label{display:block;margin:8px 0 6px;color:var(--muted);font-size:13px}
+    input[type=text]{width:100%;background:var(--zone);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--txt)}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .btn{background:var(--primary);color:#fff;border:none;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer}
+    .btn.alt{background:var(--accent)}
+    .btn.warn{background:var(--warn);color:#111}
+    .btn:disabled{opacity:.55;cursor:not-allowed}
+    .zone{border:2px dashed var(--border);background:var(--zone);border-radius:12px;padding:18px;text-align:center}
+    .hint{font-size:12px;color:var(--muted);margin-top:6px}
+    .status{margin-top:10px;font-size:14px}
+    .ok{color:var(--ok)} .err{color:var(--err)} .warn{color:var(--warn)}
+    .pill{display:inline-block;background:var(--chip);border:1px solid var(--border);border-radius:999px;padding:4px 8px;font-size:12px;color:var(--muted)}
+    .stack{display:flex;flex-direction:column;gap:10px}
+    .log{background:#0a0f1a;border:1px solid var(--border);border-radius:10px;padding:10px;min-height:120px;max-height:260px;overflow:auto;font-family:ui-monospace,Consolas,Menlo,monospace;font-size:12px;white-space:pre-wrap}
+    .kbd{background:#0b1020;border:1px solid var(--border);border-radius:6px;padding:2px 6px;font-family:ui-monospace,Consolas,Menlo,monospace}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    @media (max-width:780px){ .grid{grid-template-columns:1fr} }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+
+    <!-- Header -->
+    <div class="card">
+      <h1>Sierra → WBS Payroll (One-Click)</h1>
+      <p>Upload the weekly Sierra Excel. The server uses the pinned WBS template and returns a WBS-formatted file.</p>
+      <div class="grid">
+        <div>
+          <label for="base">Backend URL</label>
+          <input id="base" type="text" placeholder="https://your-railway-app.up.railway.app"
+                 value="https://web-production-d09f2.up.railway.app"/>
+          <div class="hint">Change if you redeploy somewhere else. Saved to your browser.</div>
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <div class="row">
+            <button id="saveBase" class="btn alt">Save URL</button>
+            <span id="baseStatus" class="pill">unsaved</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Quick Checks -->
+    <div class="card">
+      <h1>Quick checks</h1>
+      <div class="row">
+        <button id="checkHealth" class="btn">Health</button>
+        <button id="checkTemplate" class="btn">Template status</button>
+        <button id="checkRoster" class="btn">Roster status</button>
+        <button id="clearLog" class="btn warn">Clear log</button>
+      </div>
+      <div id="checkMsg" class="status"></div>
+    </div>
+
+    <!-- Converter -->
+    <div class="card">
+      <h1>Convert</h1>
+      <div class="zone" id="dropzone">
+        <div><strong>Drag & drop</strong> your Sierra file here or pick below.</div>
+        <div class="hint">Accepted: <span class="kbd">.xlsx</span> or <span class="kbd">.xls</span></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <input id="file" type="file" accept=".xlsx,.xls"/>
+        <button id="convert" class="btn">Convert to WBS</button>
+      </div>
+      <div id="convertMsg" class="status"></div>
+    </div>
+
+    <!-- Console -->
+    <div class="card">
+      <h1>Log console</h1>
+      <div id="log" class="log"></div>
+      <div class="hint">Shows each step with timestamps, response codes, and error text.</div>
+    </div>
+
+    <!-- Help -->
+    <div class="card">
+      <h1>Tips</h1>
+      <div class="stack">
+        <div>Make sure your Railway backend has the template at repo root named <span class="kbd">wbs_template.xlsx</span>.</div>
+        <div>Optional roster file at repo root: <span class="kbd">roster.xlsx</span> or <span class="kbd">roster.csv</span>.</div>
+        <div>Procfile should be: <span class="kbd">web: uvicorn server.main:app --host 0.0.0.0 --port $PORT</span></div>
+        <div>CLI test (replace file path as needed):<br/>
+          <span class="kbd">curl -f -X POST -F "file=@'Sierra Payroll 9_12_25 for Marwan.xlsx'" $(BASE)/process-payroll -o WBS_out.xlsx -D -</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    // -------------- Small util --------------
+    const $ = (id)=>document.getElementById(id);
+    const logEl = $("log");
+    function ts(){ return new Date().toLocaleTimeString(); }
+    function log(line){ logEl.textContent += `[${ts()}] ${line}\n`; logEl.scrollTop = logEl.scrollHeight; }
+    function setMsg(el, text, cls){
+      el.textContent = text;
+      el.className = "status " + (cls || "");
     }
-    def norm(v):
-        v = "" if v is None else str(v)
-        return re.sub(r"\s+"," ", v.replace("\n"," ").replace("\r"," ")).strip().lower()
-
-    best_row, best_map, best_score = None, None, -1
-    for r in range(1, ws.max_row+1):
-        row_vals = [norm(ws.cell(r,c).value) for c in range(1, ws.max_column+1)]
-        if sum(1 for v in row_vals if v) < 3: continue
-        col_map = {v:c for c,v in enumerate(row_vals, start=1) if v}
-        def pick(aliases):
-            for a in aliases:
-                if a in col_map: return col_map[a]
-                for k,c in col_map.items():
-                    if a in k: return c
-            return None
-        m = {k: pick(v) for k,v in req_aliases.items()}
-        score = sum(1 for v in m.values() if v is not None)
-        if score > best_score and m.get("name") and m.get("a01") and m.get("a02") and m.get("a03"):
-            m["reg_amt"]     = pick(opt_aliases["reg_amt"])
-            m["ot_amt"]      = pick(opt_aliases["ot_amt"])
-            m["dt_amt"]      = pick(opt_aliases["dt_amt"])
-            m["total_amt"]   = pick(opt_aliases["total_amt"])
-            m["total_plain"] = pick(opt_aliases["total_plain"])
-            best_row, best_map, best_score = r, m, score
-    if not best_row:
-        raise HTTPException(422, "WEEKLY header not found. Expect 'Employee Name' and A01/A02/A03.")
-    return best_row, best_map
-
-def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> bytes:
-    wb = load_workbook(io.BytesIO(template_bytes))
-    ws = wb["WEEKLY"] if "WEEKLY" in wb.sheetnames else wb.active
-
-    header_row, cols = _find_wbs_header(ws)
-    first_data_row = header_row + 1
-
-    scan_col = cols.get("name") or cols.get("ssn") or 2
-    last = ws.max_row
-    last_data = first_data_row - 1
-    for r in range(first_data_row, last+1):
-        if ws.cell(r, scan_col).value not in (None, ""):
-            last_data = r
-    if last_data >= first_data_row:
-        ws.delete_rows(first_data_row, last_data - first_data_row + 1)
-
-    for _, row in weekly.iterrows():
-        values = [""] * max(ws.max_column, 64)
-        if cols.get("ssn"):      values[cols["ssn"] - 1]    = row.get("ssn", "")
-        if cols.get("name"):     values[cols["name"] - 1]   = row.get("employee", "")
-        if cols.get("status"):   values[cols["status"] - 1] = row.get("Status", "A")
-        if cols.get("type"):     values[cols["type"] - 1]   = row.get("Type", "H")
-        if cols.get("rate"):     values[cols["rate"] - 1]   = row.get("rate", 0.0)
-        if cols.get("dept"):     values[cols["dept"] - 1]   = row.get("department", "")
-        if cols.get("a01"):      values[cols["a01"] - 1]    = row.get("REG", 0.0)
-        if cols.get("a02"):      values[cols["a02"] - 1]    = row.get("OT", 0.0)
-        if cols.get("a03"):      values[cols["a03"] - 1]    = row.get("DT", 0.0)
-        if cols.get("reg_amt"):  values[cols["reg_amt"] - 1] = row.get("REG_$", 0.0)
-        if cols.get("ot_amt"):   values[cols["ot_amt"] - 1]  = row.get("OT_$", 0.0)
-        if cols.get("dt_amt"):   values[cols["dt_amt"] - 1]  = row.get("DT_$", 0.0)
-        if cols.get("total_amt"):   values[cols["total_amt"] - 1]   = row.get("TOTAL_$", 0.0)
-        elif cols.get("total_plain"): values[cols["total_plain"] - 1] = row.get("TOTAL_$", 0.0)
-        ws.append(values)
-
-    ws.append([])
-    totals = {
-        "REG":     float(weekly["REG"].sum()) if "REG" in weekly else 0.0,
-        "OT":      float(weekly["OT"].sum())  if "OT" in weekly else 0.0,
-        "DT":      float(weekly["DT"].sum())  if "DT" in weekly else 0.0,
-        "REG_$":   float(weekly["REG_$"].sum()) if "REG_$" in weekly else 0.0,
-        "OT_$":    float(weekly["OT_$"].sum())  if "OT_$" in weekly else 0.0,
-        "DT_$":    float(weekly["DT_$"].sum())  if "DT_$" in weekly else 0.0,
-        "TOTAL_$": float(weekly["TOTAL_$"].sum()) if "TOTAL_$" in weekly else 0.0,
+    function saveBaseUrl(){
+      const url = $("base").value.trim();
+      localStorage.setItem("wbs_api_base", url);
+      $("baseStatus").textContent = "saved";
+      log(`Saved BASE: ${url}`);
     }
-    row_vals = [""] * max(ws.max_column, 64)
-    if cols.get("name"):     row_vals[cols["name"] - 1]  = "TOTAL"
-    if cols.get("a01"):      row_vals[cols["a01"] - 1]   = _money(totals["REG"])
-    if cols.get("a02"):      row_vals[cols["a02"] - 1]   = _money(totals["OT"])
-    if cols.get("a03"):      row_vals[cols["a03"] - 1]   = _money(totals["DT"])
-    if cols.get("reg_amt"):  row_vals[cols["reg_amt"] - 1] = _money(totals["REG_$"])
-    if cols.get("ot_amt"):   row_vals[cols["ot_amt"] - 1]  = _money(totals["OT_$"])
-    if cols.get("dt_amt"):   row_vals[cols["dt_amt"] - 1]  = _money(totals["DT_$"])
-    if cols.get("total_amt"):   row_vals[cols["total_amt"] - 1] = _money(totals["TOTAL_$"])
-    elif cols.get("total_plain"): row_vals[cols["total_plain"] - 1] = _money(totals["TOTAL_$"])
-    ws.append(row_vals)
+    function loadBaseUrl(){
+      const s = localStorage.getItem("wbs_api_base");
+      if (s){ $("base").value = s; $("baseStatus").textContent = "saved"; }
+    }
+    function getBase(){ return $("base").value.trim().replace(/\/+$/,""); }
 
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return bio.read()
+    // -------------- Startup --------------
+    loadBaseUrl();
+    $("saveBase").onclick = saveBaseUrl;
 
-# ---------- routes ----------
-@app.get("/health")
-def health():
-    return {"ok": True, "ts": datetime.utcnow().isoformat() + "Z"}
+    // -------------- Dropzone --------------
+    const dz = $("dropzone");
+    dz.addEventListener("dragover", (e)=>{ e.preventDefault(); dz.style.borderColor="#3b82f6"; });
+    dz.addEventListener("dragleave", ()=>{ dz.style.borderColor="var(--border)"; });
+    dz.addEventListener("drop", (e)=>{
+      e.preventDefault();
+      dz.style.borderColor="var(--border)";
+      const f = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) { $("file").files = e.dataTransfer.files; log(`Dropped file: ${f.name} (${f.type||"unknown"})`); }
+    });
 
-@app.get("/template-status")
-def template_status():
-    try:
-        _ = _load_template_bytes()
-        return {"template": "found"}
-    except HTTPException as e:
-        return JSONResponse({"template": "missing", "detail": str(e.detail)}, status_code=422)
+    // -------------- Quick checks --------------
+    $("checkHealth").onclick = async ()=>{
+      const base = getBase();
+      setMsg($("checkMsg"), "Checking health…"); log(`GET ${base}/health`);
+      try{
+        const r = await fetch(`${base}/health`, {mode:"cors", credentials:"omit"});
+        const txt = await r.text(); let body = txt; try{body = JSON.stringify(JSON.parse(txt));}catch(_){}
+        log(`→ ${r.status} ${r.statusText} ${body}`);
+        setMsg($("checkMsg"), r.ok ? "Health OK" : `Health not OK: ${r.status}`, r.ok ? "ok":"warn");
+      }catch(e){
+        setMsg($("checkMsg"), `Health check failed: ${e.message}`, "err");
+        log(`× Health error: ${e.message}`);
+      }
+    };
 
-@app.get("/roster-status")
-def roster_status():
-    r = _load_roster_df()
-    if r is None:
-        return {"roster": "missing"}
-    return {"roster": "found", "employees": int(r.drop_duplicates('employee_key').shape[0])}
+    $("checkTemplate").onclick = async ()=>{
+      const base = getBase();
+      setMsg($("checkMsg"), "Checking template status…"); log(`GET ${base}/template-status`);
+      try{
+        const r = await fetch(`${base}/template-status`, {mode:"cors", credentials:"omit"});
+        const txt = await r.text(); let body = txt; try{body = JSON.stringify(JSON.parse(txt));}catch(_){}
+        log(`→ ${r.status} ${r.statusText} ${body}`);
+        const ok = r.ok && /"found"/i.test(body);
+        setMsg($("checkMsg"), ok ? "Template: found" : `Template issue: ${body}`, ok ? "ok":"warn");
+      }catch(e){
+        setMsg($("checkMsg"), `Template check failed: ${e.message}`, "err");
+        log(`× Template error: ${e.message}`);
+      }
+    };
 
-@app.post("/process-payroll")
-async def process_payroll(file: UploadFile = File(..., description="Sierra payroll .xlsx")):
-    if not file or not file.filename:
-        raise HTTPException(400, "No Sierra file provided.")
-    if not _ext_ok(file.filename):
-        raise HTTPException(415, "Unsupported Sierra file type. Use .xlsx or .xls")
-    try:
-        sierra_bytes = await file.read()
-        weekly = build_weekly_from_sierra(sierra_bytes)
-    except HTTPException as he:
-        raise HTTPException(he.status_code, str(he.detail))
-    except ValueError as ve:
-        raise HTTPException(422, str(ve))
-    except Exception as e:
-        raise HTTPException(500, f"Sierra parse error: {e}")
+    $("checkRoster").onclick = async ()=>{
+      const base = getBase();
+      setMsg($("checkMsg"), "Checking roster status…"); log(`GET ${base}/roster-status`);
+      try{
+        const r = await fetch(`${base}/roster-status`, {mode:"cors", credentials:"omit"});
+        const txt = await r.text(); let body = txt; try{body = JSON.stringify(JSON.parse(txt));}catch(_){}
+        log(`→ ${r.status} ${r.statusText} ${body}`);
+        const ok = r.ok && /"found"/i.test(body);
+        setMsg($("checkMsg"), ok ? "Roster: found" : `Roster: missing`, ok ? "ok":"warn");
+      }catch(e){
+        setMsg($("checkMsg"), `Roster check failed: ${e.message}`, "err");
+        log(`× Roster error: ${e.message}`);
+      }
+    };
 
-    try:
-        tmpl = _load_template_bytes()
-        out_bytes = write_into_wbs_template(tmpl, weekly)
-    except HTTPException as he:
-        raise HTTPException(he.status_code, str(he.detail))
-    except Exception as e:
-        raise HTTPException(500, f"Template processing error: {e}")
+    $("clearLog").onclick = ()=>{ logEl.textContent = ""; };
 
-    out_name = f"WBS_Payroll_{datetime.utcnow().date()}.xlsx"
-    return StreamingResponse(
-        io.BytesIO(out_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={out_name}"}
-    )
+    // -------------- Convert --------------
+    $("convert").onclick = async ()=>{
+      const base = getBase();
+      const f = $("file").files[0];
+      if(!f){ setMsg($("convertMsg"), "Choose a Sierra .xlsx first.", "err"); return; }
+      if(!/\.(xlsx|xls)$/i.test(f.name)){ setMsg($("convertMsg"), "Unsupported file type. Use .xlsx or .xls.", "err"); return; }
+
+      $("convert").disabled = true;
+      setMsg($("convertMsg"), "Uploading and converting…");
+      log(`POST ${base}/process-payroll (file=${f.name})`);
+
+      const fd = new FormData(); fd.append("file", f);
+
+      // Timeout guard
+      const ac = new AbortController();
+      const timer = setTimeout(()=>ac.abort(), 120000);
+
+      try{
+        const r = await fetch(`${base}/process-payroll`, {
+          method:"POST",
+          body: fd,
+          mode:"cors",
+          credentials:"omit",
+          signal: ac.signal,
+        });
+        clearTimeout(timer);
+
+        if (!r.ok){
+          let detail = "";
+          try{ detail = await r.text(); }catch(_){}
+          log(`→ ERROR ${r.status}: ${detail || r.statusText}`);
+          throw new Error(`Server ${r.status}: ${detail || r.statusText || "Unknown error"}`);
+        }
+
+        // success -> download
+        const blob = await r.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        const outName = `WBS_Payroll_${new Date().toISOString().slice(0,10)}.xlsx`;
+        a.href = url; a.download = outName; document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+
+        setMsg($("convertMsg"), "Success — WBS file downloaded.", "ok");
+        log(`→ OK 200: downloaded ${outName}`);
+      }catch(e){
+        clearTimeout(timer);
+        if (e.name === "AbortError"){
+          setMsg($("convertMsg"), "Timed out after 120s. Backend may be asleep or overloaded.", "err");
+          log("× Timeout: request aborted at 120s");
+        }else{
+          setMsg($("convertMsg"), "Conversion failed: " + (e.message||e), "err");
+          log(`× Convert error: ${e.message||e}`);
+        }
+      }finally{
+        $("convert").disabled = false;
+      }
+    };
+  </script>
+</body>
+</html>
