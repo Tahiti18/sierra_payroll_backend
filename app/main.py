@@ -306,10 +306,10 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     employees = sorted(weekly_hours.keys(), key=lambda e: (str(emp_dept.get(e,"")), e))
 
     # Load WBS template (fresh each request; never saved back)
-    here = Path(__file__).resolve().parent
-    template_path = here.parent / "wbs_template.xlsx"  # repo root as you showed
-    if not template_path.exists():
-        raise HTTPException(status_code=500, detail=f"WBS template not found at {template_path}")
+here = Path(__file__).resolve().parent
+template_path = here / "wbs_template.xlsx"  # template is in the same folder as main.py
+if not template_path.exists():
+    raise HTTPException(status_code=500, detail=f"WBS template not found at {template_path}")
 
     wb = load_workbook(str(template_path))
     ws = wb.active  # the single WEEKLY sheet in your template
