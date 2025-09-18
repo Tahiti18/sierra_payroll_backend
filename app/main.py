@@ -1,484 +1,222 @@
-# server/main.py
+# app/services/wbs_generator.py
 import io
-import os
 import re
-import unicodedata
-from pathlib import Path
-from collections import Counter, defaultdict
-from datetime import datetime, date
-from typing import Optional, List, Dict, Tuple
+from typing import Tuple, Dict, Optional, Any, List
 
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import StreamingResponse, JSONResponse
-
-from app.services.wbs_generator import write_into_wbs_template  # writer for WEEKLY tab only
-
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="8.0.1")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-BASE_DIR = Path(__file__).resolve().parents[1]
-SEARCH_DIRS = [BASE_DIR, BASE_DIR / "app", BASE_DIR / "app" / "data", BASE_DIR / "server"]
-ALLOWED_EXTS = (".xlsx", ".xls")
+from fastapi import HTTPException
+from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.cell import Cell
 
 
-# ---------------- helpers ----------------
-def _std(s: str) -> str:
-    return (s or "").strip().lower().replace("\n", " ").replace("\r", " ")
-
-def _ext_ok(name: str) -> bool:
-    n = (name or "").lower()
-    return any(n.endswith(e) for e in ALLOWED_EXTS)
-
-def _clean_space(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s).strip())
-
-def _name_parts(name: str) -> Tuple[str, str]:
-    name = _clean_space(name)
-    if "," in name:
-        last, first = name.split(",", 1)
-        return last.strip(), first.strip()
-    parts = name.split(" ")
-    if len(parts) >= 2:
-        last = parts[-1].strip()
-        first = " ".join(parts[:-1]).strip()
-        return last, first
-    return name.strip(), ""
-
-def _canon_name(s: str) -> str:
-    s = _clean_space(s)
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.replace(".", "")
-    s = re.sub(r"\s*,\s*", ",", s)
-    return s.lower()
-
-def _to_date(v) -> Optional[date]:
-    if pd.isna(v): return None
-    try: return pd.to_datetime(v).date()
-    except Exception: return None
-
-def _to_number(x) -> float:
-    if x is None or (isinstance(x, float) and pd.isna(x)): return 0.0
-    s = str(x).strip()
-    if s == "" or s.lower() in ("nan", "none"): return 0.0
-    s = re.sub(r"[^0-9\.\-]", "", s)
+def _money(val) -> float:
     try:
-        return float(s) if s not in ("", "-", ".", "-.") else 0.0
+        return float(val or 0.0)
     except Exception:
-        try: return float(x)
-        except Exception: return 0.0
+        return 0.0
 
-def _money(x: float) -> float:
-    try: return round(float(x or 0.0), 2)
-    except Exception: return 0.0
 
-def _find_file(basenames: List[str]) -> Optional[Path]:
-    env_map = {"wbs_template.xlsx": "WBS_TEMPLATE_PATH", "roster.xlsx": "ROSTER_PATH", "roster.csv": "ROSTER_PATH"}
-    for name in basenames:
-        env_key = env_map.get(name)
-        if env_key:
-            p = os.getenv(env_key)
-            if p and Path(p).exists():
-                return Path(p)
-    for d in SEARCH_DIRS:
-        for name in basenames:
-            p = d / name
-            if p.exists():
-                return p
-    return None
+def _norm(v: Any) -> str:
+    s = "" if v is None else str(v)
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
 
-def _load_template_bytes() -> bytes:
-    p = _find_file(["wbs_template.xlsx"])
-    if not p:
-        raise HTTPException(422, "WBS template not found. Place 'wbs_template.xlsx' at repo root or set WBS_TEMPLATE_PATH.")
-    return p.read_bytes()
 
-def _load_roster_df() -> Optional[pd.DataFrame]:
-    """Load roster.xlsx or roster.csv if present. All columns optional; SSN may be blank."""
-    p = _find_file(["roster.xlsx", "roster.csv"])
-    if not p:
-        return None
+def _find_wbs_header(ws: Worksheet) -> Tuple[int, Dict[str, int]]:
+    """
+    Locate the header row and map columns. Accepts common header variants.
+    """
+    req_aliases = {
+        "ssn":   ["ssn"],
+        "name":  ["employee name", "employee", "name"],
+        "status":["status"],
+        "type":  ["type"],
+        "rate":  ["pay rate", "payrate", "rate"],
+        "dept":  ["dept", "department"],
+        "a01":   ["a01", "regular", "reg"],
+        "a02":   ["a02", "overtime", "ot"],
+        "a03":   ["a03", "doubletime", "dt"],
+    }
+    opt_aliases = {
+        "reg_amt":     ["a01 $", "a01$", "reg $", "regular $", "regular amt", "a01 amount"],
+        "ot_amt":      ["a02 $", "a02$", "ot $",  "overtime $", "overtime amt", "a02 amount"],
+        "dt_amt":      ["a03 $", "a03$", "dt $",  "doubletime $", "doubletime amt", "a03 amount"],
+        "total_amt":   ["total $", "total$", "grand total $"],
+        "total_plain": ["total", "totals"],  # far-right shaded column
+    }
+
+    best_row, best_map, best_score = None, None, -1
+    for r in range(1, ws.max_row + 1):
+        row_vals = [_norm(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)]
+        if sum(1 for v in row_vals if v) < 3:
+            continue
+
+        # build lookup
+        col_map = {}
+        for c, v in enumerate(row_vals, start=1):
+            if v and v not in col_map:
+                col_map[v] = c
+
+        def pick(aliases: List[str]) -> Optional[int]:
+            for a in aliases:
+                if a in col_map:
+                    return col_map[a]
+                for v, c in col_map.items():
+                    if a in v:
+                        return c
+            return None
+
+        tmp = {k: pick(v) for k, v in req_aliases.items()}
+        score = sum(1 for v in tmp.values() if v is not None)
+        if score > best_score and tmp.get("name") and tmp.get("a01") and tmp.get("a02") and tmp.get("a03"):
+            tmp["reg_amt"]     = pick(opt_aliases["reg_amt"])
+            tmp["ot_amt"]      = pick(opt_aliases["ot_amt"])
+            tmp["dt_amt"]      = pick(opt_aliases["dt_amt"])
+            tmp["total_amt"]   = pick(opt_aliases["total_amt"])
+            tmp["total_plain"] = pick(opt_aliases["total_plain"])
+            best_row, best_map, best_score = r, tmp, score
+
+    if not best_row or not best_map:
+        raise HTTPException(422, "WEEKLY header not found. Need columns like 'Employee Name', 'A01', 'A02', 'A03'.")
+    return best_row, best_map
+
+
+def _copy_style(dst: Cell, src: Cell) -> None:
+    """
+    Clone style attributes from src → dst to preserve WBS look.
+    """
+    if src.has_style:
+        dst.font = src.font
+        dst.fill = src.fill
+        dst.border = src.border
+        dst.alignment = src.alignment
+        dst.number_format = src.number_format
+        dst.protection = src.protection
+
+
+def _blank_if_zero(val: Any) -> Optional[float]:
     try:
-        if p.suffix.lower() == ".xlsx":
-            df = pd.read_excel(p, dtype=str)
-        else:
-            df = pd.read_csv(p, dtype=str)
-    except Exception as e:
-        raise HTTPException(422, f"Roster load failed: {e}")
-    if df.empty:
-        return None
-
-    def find_col(options: List[str]) -> Optional[str]:
-        norm = {_std(c): c for c in df.columns}
-        for want in options:
-            w = _std(want)
-            if w in norm: return norm[w]
-        for want in options:
-            w = _std(want)
-            for k, c in norm.items():
-                if w in k: return c
-        return None
-
-    name_col = find_col(["employee name", "employee", "name"])
-    ssn_col  = find_col(["ssn", "social", "social security"])
-    rate_col = find_col(["payrate", "rate", "hourly rate", "wage"])
-    dept_col = find_col(["dept", "department", "division"])
-    type_col = find_col(["type", "employee type", "emp type"])
-
-    if not name_col:
-        return None
-
-    out = pd.DataFrame({
-        "employee_disp": df[name_col].astype(str).map(_clean_space),
-        "employee_key":  df[name_col].astype(str).map(_canon_name),
-        "ssn":           (df[ssn_col].astype(str).map(str.strip) if ssn_col else pd.Series([""]*len(df))),
-        "rate_roster":   pd.to_numeric(df[rate_col].map(_to_number), errors="coerce") if rate_col else pd.Series([None]*len(df)),
-        "department_roster": df[dept_col].astype(str).map(str.strip) if dept_col else pd.Series([""]*len(df)),
-        "wtype_roster":      df[type_col].astype(str).map(str.strip) if type_col else pd.Series([""]*len(df)),
-    }).dropna(subset=["employee_key"]).drop_duplicates(subset=["employee_key"], keep="last")
-
-    return out
+        v = float(val)
+        return None if abs(v) < 1e-9 else v
+    except Exception:
+        return val
 
 
-# ---------------- Sierra parsing ----------------
-COMMON_EMP  = ["employee", "employee name", "name", "worker", "employee_name"]
-COMMON_DATE = ["date", "work date", "day", "worked date"]
-COMMON_HRS  = ["hours", "hrs", "total hours", "work hours", "a01", "regular", "reg"]
-COMMON_RATE = ["rate", "pay rate", "hourly rate", "wage", "base rate"]
+def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> bytes:
+    """
+    Write ONLY into the 'WEEKLY' sheet, cloning the template's row styles so the
+    output matches WBS exactly. Zeros become blanks.
+    """
+    wb = load_workbook(io.BytesIO(template_bytes))
+    ws = wb["WEEKLY"] if "WEEKLY" in wb.sheetnames else wb.active
 
-def _guess_col(df: pd.DataFrame, options: List[str]) -> Optional[str]:
-    norm = {_std(c): c for c in df.columns}
-    for want in options:
-        w = _std(want)
-        if w in norm: return norm[w]
-    for want in options:
-        w = _std(want)
-        for k, c in norm.items():
-            if w in k: return c
-    return None
+    header_row, cols = _find_wbs_header(ws)
+    first_data_row = header_row + 1
 
-def _guess_employee_col(df: pd.DataFrame) -> Optional[str]:
-    c = _guess_col(df, COMMON_EMP)
-    if c: return c
-    best, score = None, -1
-    for col in df.columns:
-        s = df[col].astype(str)
-        looks = s.str.contains(r"[A-Za-z],\s*[A-Za-z]", regex=True, na=False).mean()
-        if looks > score:
-            best, score = col, looks
-    return best if score >= 0.2 else None
+    # 1) Find last existing data row and clear data area (keep styles/merged cells)
+    scan_col = cols.get("name") or cols.get("ssn") or 2
+    last = ws.max_row
+    last_data = first_data_row - 1
+    for r in range(first_data_row, last + 1):
+        if ws.cell(r, scan_col).value not in (None, ""):
+            last_data = r
+    if last_data >= first_data_row:
+        ws.delete_rows(first_data_row, last_data - first_data_row + 1)
 
-def _guess_date_col(df: pd.DataFrame) -> Optional[str]:
-    c = _guess_col(df, COMMON_DATE)
-    if c: return c
-    best, score = None, -1
-    for col in df.columns:
-        s = df[col]
-        try:
-            parsed = pd.to_datetime(s, errors="coerce")
-            sc = parsed.notna().mean()
-            if sc > score:
-                score, best = sc, col
-        except Exception:
-            continue
-    return best if score >= 0.3 else None
+    # 2) Grab a "prototype" row style from the first blank row (immediately under header)
+    proto_row_idx = first_data_row
+    # If the first row under header is not blank, insert one temporary blank row as prototype
+    need_temp_proto = False
+    if any(ws.cell(proto_row_idx, c).value not in (None, "") for c in range(1, ws.max_column + 1)):
+        ws.insert_rows(proto_row_idx, 1)
+        need_temp_proto = True
 
-def _guess_hours_col(df: pd.DataFrame) -> Optional[str]:
-    c = _guess_col(df, COMMON_HRS)
-    if c: return c
-    best, score = None, -1
-    for col in df.columns:
-        try:
-            v = pd.to_numeric(df[col].map(_to_number), errors="coerce")
-        except Exception:
-            continue
-        ok = v.between(0, 24, inclusive="both").mean()
-        nz = (v > 0).mean()
-        sc = ok * 0.6 + nz * 0.4
-        if sc > score:
-            best, score = col, sc
-    return best if score >= 0.3 else None
+    # Snapshot styles per column from the prototype row
+    proto_styles = {}
+    for c in range(1, ws.max_column + 1):
+        proto_styles[c] = ws.cell(proto_row_idx, c).copy()
 
-def _guess_rate_col(df: pd.DataFrame) -> Optional[str]:
-    c = _guess_col(df, COMMON_RATE)
-    if c: return c
-    best, score = None, -1
-    for col in df.columns:
-        try:
-            v = pd.to_numeric(df[col].map(_to_number), errors="coerce")
-        except Exception:
-            continue
-        ok = v.between(10, 200, inclusive="both").mean()
-        nz = (v > 0).mean()
-        sc = ok * 0.7 + nz * 0.3
-        if sc > score:
-            best, score = col, sc
-    return best if score >= 0.2 else None
+    # Remove the temporary prototype if we inserted one, but keep the style snapshot
+    if need_temp_proto:
+        ws.delete_rows(proto_row_idx, 1)
 
-def _ca_daily_ot(h: float) -> Dict[str, float]:
-    h = float(h or 0.0)
-    reg = min(h, 8.0); ot = min(max(h-8.0, 0.0), 4.0); dt = max(h-12.0, 0.0)
-    return {"REG": reg, "OT": ot, "DT": dt}
+    # Helper to set a value at (row, col) and clone style from proto
+    def put(r: int, c: int, value: Any):
+        cell = ws.cell(r, c)
+        # clone style
+        _copy_style(cell, proto_styles.get(c, ws.cell(header_row, c)))
+        # write blank instead of 0
+        cell.value = _blank_if_zero(value)
 
-def _build_weekly(sierra_bytes: bytes) -> pd.DataFrame:
-    # Read first sheet
-    excel = pd.ExcelFile(io.BytesIO(sierra_bytes))
-    sheet = excel.sheet_names[0]
-    df = excel.parse(sheet)
+    # 3) Write each weekly row, cloning styles
+    write_row = first_data_row
+    for _, row in weekly.iterrows():
+        # Ensure we have at least up to the far-right mapped column
+        max_target_col = max([v for v in cols.values() if v is not None] + [ws.max_column])
+        for c in range(1, max_target_col + 1):
+            # Pre-style the entire row (keeps borders/fills across empty columns)
+            put(write_row, c, None)
 
-    # Roster (optional)
-    roster = _load_roster_df()
-    rate_map = {}
-    ssn_map  = {}
-    dept_map = {}
-    type_map = {}
-    if roster is not None and not roster.empty:
-        rate_map = {k: float(v) for k, v in zip(roster["employee_key"], roster["rate_roster"]) if pd.notna(v)}
-        ssn_map  = {k: (s or "") for k, s in zip(roster["employee_key"], roster["ssn"])}
-        dept_map = {k: (d or "") for k, d in zip(roster["employee_key"], roster["department_roster"])}
-        type_map = {k: (t or "") for k, t in zip(roster["employee_key"], roster["wtype_roster"])}
+        if cols.get("ssn"):      put(write_row, cols["ssn"],      row.get("ssn", ""))
+        if cols.get("name"):     put(write_row, cols["name"],     row.get("employee", ""))
+        if cols.get("status"):   put(write_row, cols["status"],   row.get("Status", "A"))
+        if cols.get("type"):     put(write_row, cols["type"],     row.get("Type", "H"))
+        if cols.get("rate"):     put(write_row, cols["rate"],     row.get("rate", 0.0))
+        if cols.get("dept"):     put(write_row, cols["dept"],     row.get("department", ""))
 
-    # Base columns
-    emp_col  = _guess_employee_col(df)
-    rate_col = _guess_rate_col(df)  # optional; fallback to roster
-    if not emp_col:
-        raise ValueError("Could not find 'Employee' column in Sierra file.")
+        if cols.get("a01"):      put(write_row, cols["a01"],      row.get("REG", 0.0))
+        if cols.get("a02"):      put(write_row, cols["a02"],      row.get("OT", 0.0))
+        if cols.get("a03"):      put(write_row, cols["a03"],      row.get("DT", 0.0))
 
-    dep_col = _guess_col(df, ["department", "dept", "division"])
-    typ_col = _guess_col(df, ["type", "employee type", "emp type", "pay type"])
+        if cols.get("reg_amt"):  put(write_row, cols["reg_amt"],  row.get("REG_$", 0.0))
+        if cols.get("ot_amt"):   put(write_row, cols["ot_amt"],   row.get("OT_$", 0.0))
+        if cols.get("dt_amt"):   put(write_row, cols["dt_amt"],   row.get("DT_$", 0.0))
 
-    employee = df[emp_col].astype(str).map(_clean_space)
-    emp_key  = employee.map(_canon_name)
+        # Prefer explicit Total $; else the far-right shaded Total/Totals
+        total_val = row.get("TOTAL_$", 0.0)
+        if cols.get("total_amt"):
+            put(write_row, cols["total_amt"], total_val)
+        elif cols.get("total_plain"):
+            put(write_row, cols["total_plain"], total_val)
 
-    raw_rate = df[rate_col].map(_to_number) if rate_col else pd.Series([0.0]*len(df))
-    rate = []
-    for k, r in zip(emp_key, raw_rate):
-        v = float(r or 0.0)
-        if v <= 0 and k in rate_map: v = float(rate_map[k] or 0.0)
-        rate.append(v)
-    rate = pd.Series(rate, dtype=float)
+        write_row += 1
 
-    base = pd.DataFrame({
-        "employee":   employee,
-        "emp_key":    emp_key,
-        "rate":       rate.astype(float),
-        "department": (df[dep_col].astype(str).map(str.strip) if dep_col else ""),
-        "wtype":      (df[typ_col].astype(str).map(str.strip) if typ_col else ""),
-    })
+    # 4) Spacer row (styled like prototype, blank)
+    for c in range(1, ws.max_column + 1):
+        put(write_row, c, None)
+    write_row += 1
 
-    # MODE 1: Date+Hours
-    date_col = _guess_date_col(df)
-    hrs_col  = _guess_hours_col(df)
-    has_date_hours = bool(date_col and hrs_col)
+    # 5) TOTAL row (clone style + label "TOTAL" in name col; fill sums)
+    totals = {
+        "REG":     float(weekly["REG"].sum())     if "REG" in weekly else 0.0,
+        "OT":      float(weekly["OT"].sum())      if "OT" in weekly else 0.0,
+        "DT":      float(weekly["DT"].sum())      if "DT" in weekly else 0.0,
+        "REG_$":   float(weekly["REG_$"].sum())   if "REG_$" in weekly else 0.0,
+        "OT_$":    float(weekly["OT_$"].sum())    if "OT_$" in weekly else 0.0,
+        "DT_$":    float(weekly["DT_$"].sum())    if "DT_$" in weekly else 0.0,
+        "TOTAL_$": float(weekly["TOTAL_$"].sum()) if "TOTAL_$" in weekly else 0.0,
+    }
 
-    # MODE 2: Mon–Sun columns
-    day_candidates = [
-        ("mon", ["mon","monday"]),
-        ("tue", ["tue","tues","tuesday"]),
-        ("wed", ["wed","weds","wednesday"]),
-        ("thu", ["thu","thur","thurs","thursday"]),
-        ("fri", ["fri","friday"]),
-        ("sat", ["sat","saturday"]),
-        ("sun", ["sun","sunday"]),
-    ]
-    day_cols: Dict[str,str] = {}
-    normcols = { _std(c): c for c in df.columns }
-    for day_key, aliases in day_candidates:
-        found = None
-        for alias in aliases:
-            for k,c in normcols.items():
-                if alias in k:
-                    found = c
-                    break
-            if found: break
-        if found:
-            day_cols[day_key] = found
-    has_weekdays = len(day_cols) >= 4
+    for c in range(1, ws.max_column + 1):
+        put(write_row, c, None)
 
-    if not has_date_hours and not has_weekdays:
-        raise ValueError("Could not find Date+Hours or weekday (Mon..Sun) columns in Sierra file.")
+    if cols.get("name"):     put(write_row, cols["name"], "TOTAL")
+    if cols.get("a01"):      put(write_row, cols["a01"],  _money(totals["REG"]))
+    if cols.get("a02"):      put(write_row, cols["a02"],  _money(totals["OT"]))
+    if cols.get("a03"):      put(write_row, cols["a03"],  _money(totals["DT"]))
+    if cols.get("reg_amt"):  put(write_row, cols["reg_amt"], _money(totals["REG_$"]))
+    if cols.get("ot_amt"):   put(write_row, cols["ot_amt"],  _money(totals["OT_$"]))
+    if cols.get("dt_amt"):   put(write_row, cols["dt_amt"],  _money(totals["DT_$"]))
 
-    per_day_frames: List[pd.DataFrame] = []
+    if cols.get("total_amt"):
+        put(write_row, cols["total_amt"], _money(totals["TOTAL_$"]))
+    elif cols.get("total_plain"):
+        put(write_row, cols["total_plain"], _money(totals["TOTAL_$"]))
 
-    if has_date_hours:
-        tmp = pd.DataFrame({
-            "emp_key":    base["emp_key"],
-            "employee":   base["employee"],
-            "date":       df[date_col].map(_to_date),
-            "hours":      pd.to_numeric(df[hrs_col].map(_to_number), errors="coerce").fillna(0.0).astype(float),
-            "rate":       base["rate"],
-            "department": base["department"],
-            "wtype":      base["wtype"],
-        })
-        tmp = tmp[(tmp["employee"].str.len() > 0) & tmp["date"].notna() & (tmp["hours"] > 0)]
-        per_day_frames.append(tmp)
-
-    if has_weekdays:
-        for day_key, col in day_cols.items():
-            hrs = pd.to_numeric(df[col].map(_to_number), errors="coerce").fillna(0.0).astype(float)
-            tmp = pd.DataFrame({
-                "emp_key":    base["emp_key"],
-                "employee":   base["employee"],
-                "date":       day_key,
-                "hours":      hrs,
-                "rate":       base["rate"],
-                "department": base["department"],
-                "wtype":      base["wtype"],
-            })
-            tmp = tmp[(tmp["employee"].str.len() > 0) & (tmp["hours"] > 0)]
-            per_day_frames.append(tmp)
-
-    core = pd.concat(per_day_frames, ignore_index=True)
-
-    # choose final rate/department/type per employee
-    chosen_rate, first_dept, first_type = {}, {}, {}
-    for k,g in core.groupby("emp_key"):
-        rates = Counter([float(r) for r in g["rate"].tolist()])
-        chosen_rate[k] = max(rates.items(), key=lambda kv: kv[1])[0] if rates else 0.0
-        first_dept[k]  = g["department"].dropna().astype(str).replace("nan","").iloc[0] if not g.empty else ""
-        wtyp = str(g["wtype"].dropna().astype(str).replace("nan","").iloc[0] if not g.empty else "")
-        first_type[k]  = "S" if wtyp.upper().startswith("S") else "H"
-
-    # split daily hours into REG/OT/DT (CA-like)
-    parts = []
-    for (k, emp, day), g in core.groupby(["emp_key","employee","date"], dropna=False):
-        day_hours = float(g["hours"].sum())
-        split = _ca_daily_ot(day_hours)
-        parts.append({"emp_key": k, "employee": emp, "date": day,
-                      "REG": split["REG"], "OT": split["OT"], "DT": split["DT"]})
-    split_df = pd.DataFrame(parts)
-
-    weekly_hours = split_df.groupby(["emp_key","employee"], dropna=False)[["REG","OT","DT"]].sum().reset_index()
-
-    # Allocate $ proportionally across multiple sub-entries in same day
-    dollars = defaultdict(lambda: {"REG_$":0.0,"OT_$":0.0,"DT_$":0.0})
-    day_totals = {(r["emp_key"], r["date"]): r for _, r in split_df.iterrows()}
-    for _, rec in core.iterrows():
-        key = (rec["emp_key"], rec["date"])
-        if key not in day_totals:
-            continue
-        tot = day_totals[key]
-        day_sum = float(tot["REG"] + tot["OT"] + tot["DT"])
-        if day_sum <= 0:
-            continue
-        portion   = float(rec["hours"]) / day_sum
-        base_rate = float(rec["rate"]) if float(rec["rate"]) > 0 else float(chosen_rate.get(rec["emp_key"], 0.0))
-        dollars[rec["emp_key"]]["REG_$"] += tot["REG"] * portion * base_rate
-        dollars[rec["emp_key"]]["OT_$"]  += tot["OT"]  * portion * base_rate * 1.5
-        dollars[rec["emp_key"]]["DT_$"]  += tot["DT"]  * portion * base_rate * 2.0
-
-    weekly = weekly_hours.copy()
-    weekly["REG_$"]   = weekly["emp_key"].map(lambda k: _money(dollars[k]["REG_$"]))
-    weekly["OT_$"]    = weekly["emp_key"].map(lambda k: _money(dollars[k]["OT_$"]))
-    weekly["DT_$"]    = weekly["emp_key"].map(lambda k: _money(dollars[k]["DT_$"]))
-    weekly["TOTAL_$"] = weekly["REG_$"] + weekly["OT_$"] + weekly["DT_$"]
-
-    weekly["rate"]       = weekly["emp_key"].map(lambda k: _money(chosen_rate.get(k, 0.0)))
-    weekly["department"] = weekly["emp_key"].map(lambda k: first_dept.get(k, ""))
-    weekly["Status"]     = "A"
-    weekly["Type"]       = weekly["emp_key"].map(lambda k: first_type.get(k, "H"))
-
-    # <- SSN OPTIONAL (from roster if available; otherwise blank)
-    weekly["ssn"] = weekly["emp_key"].map(lambda k: ssn_map.get(k, "")).fillna("").astype(str)
-
-    for c in ["REG","OT","DT"]:
-        weekly[c] = weekly[c].map(_money)
-
-    weekly = weekly[[
-        "emp_key","employee","ssn","Status","Type","rate","department",
-        "REG","OT","DT","REG_$","OT_$","DT_$","TOTAL_$"
-    ]].copy()
-
-    # Merge roster (best-effort only) to backfill blanks — never error on SSN
-    if roster is not None and not roster.empty:
-        w = weekly.copy()
-        w["k_lf"]  = w["employee"].map(lambda s: ",".join(_name_parts(s)).lower())
-        r = roster.copy()
-        r["k_lf"]  = r["employee_disp"].map(lambda s: ",".join(_name_parts(s)).lower())
-        m = w.merge(r[["k_lf","ssn","rate_roster","department_roster","wtype_roster"]],
-                    on="k_lf", how="left")
-
-        # Fill SSN only if blank
-        m["ssn_x"] = m["ssn_x"].fillna("")
-        m["ssn_y"] = m["ssn_y"].fillna("")
-        m["ssn"] = m.apply(lambda row: row["ssn_x"] if str(row["ssn_x"]).strip() != "" else row["ssn_y"], axis=1)
-
-        # Fill other fields if missing
-        m["rate"] = m.apply(lambda row: row["rate"] if row["rate"]>0 else _to_number(row.get("rate_roster")), axis=1)
-        m["department"] = m.apply(lambda row: row["department"] if str(row["department"]).strip() not in ("","nan","None")
-                                  else (row.get("department_roster") or ""), axis=1)
-        m["Type"] = m.apply(lambda row: row["Type"] if str(row["Type"]).strip() not in ("","nan","None")
-                            else ("S" if str(row.get("wtype_roster","")).upper().startswith("S") else "H"), axis=1)
-
-        m = m.drop(columns=["k_lf","ssn_x","ssn_y","rate_roster","department_roster","wtype_roster"])
-        weekly = m
-
-    weekly = weekly.drop(columns=["emp_key"])
-    # hard guarantee: SSN column exists and is string
-    if "ssn" not in weekly.columns:
-        weekly["ssn"] = ""
-    weekly["ssn"] = weekly["ssn"].fillna("").astype(str)
-
-    return weekly
-
-
-# ---------------- routes ----------------
-@app.get("/health")
-def health():
-    return {"ok": True, "ts": datetime.utcnow().isoformat() + "Z"}
-
-@app.get("/template-status")
-def template_status():
-    try:
-        _ = _load_template_bytes()
-        return {"template": "found"}
-    except HTTPException as e:
-        return JSONResponse({"template": "missing", "detail": str(e.detail)}, status_code=422)
-
-@app.get("/roster-status")
-def roster_status():
-    r = _load_roster_df()
-    if r is None:
-        return {"roster": "missing"}
-    return {"roster": "found", "employees": int(r.drop_duplicates('employee_key').shape[0])}
-
-@app.post("/process-payroll")
-async def process_payroll(file: UploadFile = File(..., description="Sierra payroll .xlsx")):
-    if not file or not file.filename:
-        raise HTTPException(400, "No Sierra file provided.")
-    if not _ext_ok(file.filename):
-        raise HTTPException(415, "Unsupported Sierra file type. Use .xlsx or .xls")
-
-    try:
-        sierra_bytes = await file.read()
-        weekly = _build_weekly(sierra_bytes)
-    except HTTPException as he:
-        raise HTTPException(he.status_code, str(he.detail))
-    except ValueError as ve:
-        raise HTTPException(422, str(ve))
-    except Exception as e:
-        raise HTTPException(500, f"Sierra parse error: {e}")
-
-    try:
-        tmpl = _load_template_bytes()
-        out_bytes = write_into_wbs_template(tmpl, weekly)
-    except HTTPException as he:
-        raise HTTPException(he.status_code, str(he.detail))
-    except Exception as e:
-        raise HTTPException(500, f"Template processing error: {e}")
-
-    out_name = f"WBS_Payroll_{datetime.utcnow().date()}.xlsx"
-    return StreamingResponse(
-        io.BytesIO(out_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={out_name}"}
-    )
+    # 6) Save back
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.read()
