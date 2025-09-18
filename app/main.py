@@ -12,11 +12,11 @@ from starlette.responses import StreamingResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="7.1.1")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="7.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],     # Lock this to your Netlify domain later
+    allow_origins=["*"],   # lock this down to your frontend origin later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -54,7 +54,7 @@ def _ext_ok(name: str) -> bool:
 def _clean_space(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip())
 
-def _name_parts(name: str):
+def _name_parts(name: str) -> Tuple[str, str]:
     name = _clean_space(name)
     if "," in name:
         last, first = name.split(",", 1)
@@ -85,12 +85,11 @@ def _canon_name(s: str) -> str:
 
 def _to_date(v) -> Optional[date]:
     if pd.isna(v): return None
-    try:
-        return pd.to_datetime(v).date()
-    except Exception:
-        return None
+    try: return pd.to_datetime(v).date()
+    except Exception: return None
 
 def _to_number(x) -> float:
+    """Robust numeric parser: handles $, commas, spaces, text; returns 0.0 on failure."""
     if x is None or (isinstance(x, float) and pd.isna(x)): return 0.0
     s = str(x).strip()
     if s == "" or s.lower() in ("nan","none"): return 0.0
@@ -131,7 +130,8 @@ def _load_roster_df() -> Optional[pd.DataFrame]:
         df = pd.read_excel(p, dtype=str)
     else:
         df = pd.read_csv(p, dtype=str)
-    if df.empty: return None
+    if df.empty:
+        return None
 
     name_col = _find_col(df, ["employee name","employee","name"])
     ssn_col  = _find_col(df, ["ssn","social","social security"])
@@ -139,7 +139,8 @@ def _load_roster_df() -> Optional[pd.DataFrame]:
     dept_col = _find_col(df, ["dept","department","division"])
     type_col = _find_col(df, ["type","employee type","emp type"])
 
-    if not name_col: return None
+    if not name_col:
+        return None
 
     out = pd.DataFrame({
         "employee_disp": df[name_col].astype(str).map(_clean_space),
@@ -237,7 +238,7 @@ def build_weekly_from_sierra(xlsx_bytes: bytes, sheet_name: Optional[str]=None) 
         rate_map = {k: float(v) for k, v in zip(roster_df["employee_key"], roster_df["rate_roster"]) if pd.notna(v)}
 
     emp_col  = _guess_employee_col(df)
-    rate_col = _guess_rate_col(df)  # optional; we’ll fallback to roster
+    rate_col = _guess_rate_col(df)  # optional; fallback to roster
     if not emp_col:
         raise ValueError("Sierra header detection failed; missing: employee")
 
@@ -436,44 +437,58 @@ def _apply_roster_defaults_by_key(weekly_df: pd.DataFrame, roster: Optional[pd.D
 def _find_wbs_header(ws: Worksheet) -> Tuple[int, Dict[str, int]]:
     # Must have these core labels on the header row (case-insensitive)
     targets = ["ssn","employee name","status","type","pay rate","dept","a01","a02","a03"]
-    for r in range(1, ws.max_row+1):
-        lower = [(_std(str(ws.cell(r,c).value)) if ws.cell(r,c).value is not None else "") for c in range(1, ws.max_column+1)]
+    for r in range(1, ws.max_row + 1):
+        lower = [(_std(str(ws.cell(r, c).value)) if ws.cell(r, c).value is not None else "")
+                 for c in range(1, ws.max_column + 1)]
         if all(any(t == lv for lv in lower) for t in targets):
-            col_map = { lv: c for c, lv in enumerate(lower, start=1) }
+            col_map = {lv: c for c, lv in enumerate(lower, start=1)}
             # dollar columns are optional; write only if present
             def pick(*names):
                 for n in names:
-                    if n in col_map: return col_map[n]
+                    if n in col_map:
+                        return col_map[n]
                 return None
             return r, {
-                "ssn": col_map.get("ssn"),
-                "name": col_map.get("employee name"),
+                "ssn":   col_map.get("ssn"),
+                "name":  col_map.get("employee name"),
                 "status": col_map.get("status"),
-                "type": col_map.get("type"),
-                "rate": col_map.get("pay rate"),
-                "dept": col_map.get("dept"),
-                "a01": col_map.get("a01"),
-                "a02": col_map.get("a02"),
-                "a03": col_map.get("a03"),
-                "reg$":   pick("reg $","a01 $","regular $","a01$"),
-                "ot$":    pick("ot $","a02 $","overtime $","a02$"),
-                "dt$":    pick("dt $","a03 $","doubletime $","a03$"),
-                "total$": pick("total $","total$","grand total $"),
+                "type":   col_map.get("type"),
+                "rate":   col_map.get("pay rate"),
+                "dept":   col_map.get("dept"),
+                "a01":    col_map.get("a01"),
+                "a02":    col_map.get("a02"),
+                "a03":    col_map.get("a03"),
+                "reg$":   pick("reg $", "a01 $", "regular $", "a01$"),
+                "ot$":    pick("ot $",  "a02 $", "overtime $", "a02$"),
+                "dt$":    pick("dt $",  "a03 $", "doubletime $", "a03$"),
+                "total$": pick("total $", "total$", "grand total $"),
+                # Some templates label the far-right pink/orange column simply "total"
+                "total":  pick("total"),
             }
-    raise HTTPException(422, detail="Could not locate WBS header row in template (need SSN, Employee Name, Status, Type, Pay Rate, Dept, A01/A02/A03).")
+    raise HTTPException(
+        422,
+        detail="Could not locate WBS header row in template (need SSN, Employee Name, Status, Type, Pay Rate, Dept, A01/A02/A03)."
+    )
 
 def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> bytes:
+    """
+    Writes data ONLY to the 'WEEKLY' sheet to match the WBS layout.
+    - Populates SSN, Employee Name, Status, Type, Pay Rate, Dept, A01, A02, A03.
+    - Also populates REG$/OT$/DT$/TOTAL$ when those columns exist in the header.
+    - If no explicit 'Total $' column, fills the far-right 'Total' column if present.
+    - Does NOT create any extra sheets.
+    """
     wb = load_workbook(io.BytesIO(template_bytes))
     ws = wb["WEEKLY"] if "WEEKLY" in wb.sheetnames else wb.active
 
     header_row, cols = _find_wbs_header(ws)
     first_data_row = header_row + 1
 
-    # Clear old data rows (only section below header)
+    # Clear old data rows (keep formatting)
     scan_col = cols.get("name") or cols.get("ssn") or 2
     last = ws.max_row
     last_data = first_data_row - 1
-    for r in range(first_data_row, last+1):
+    for r in range(first_data_row, last + 1):
         if ws.cell(r, scan_col).value not in (None, ""):
             last_data = r
     if last_data >= first_data_row:
@@ -481,71 +496,56 @@ def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> byte
 
     # Append weekly rows
     for _, row in weekly.iterrows():
-        values = [""] * max(ws.max_column, 20)
-        if cols.get("ssn")    : values[cols["ssn"]-1]    = row["ssn"]
-        if cols.get("name")   : values[cols["name"]-1]   = row["employee"]
-        if cols.get("status") : values[cols["status"]-1] = row["Status"]
-        if cols.get("type")   : values[cols["type"]-1]   = row["Type"]
-        if cols.get("rate")   : values[cols["rate"]-1]   = row["rate"]
-        if cols.get("dept")   : values[cols["dept"]-1]   = row["department"]
-        if cols.get("a01")    : values[cols["a01"]-1]    = row["REG"]
-        if cols.get("a02")    : values[cols["a02"]-1]    = row["OT"]
-        if cols.get("a03")    : values[cols["a03"]-1]    = row["DT"]
-        if cols.get("reg$")   : values[cols["reg$"]-1]   = row["REG_$"]
-        if cols.get("ot$")    : values[cols["ot$"]-1]    = row["OT_$"]
-        if cols.get("dt$")    : values[cols["dt$"]-1]    = row["DT_$"]
-        if cols.get("total$") : values[cols["total$"]-1] = row["TOTAL_$"]
+        values = [""] * max(ws.max_column, 64)
+        if cols.get("ssn"):     values[cols["ssn"] - 1]    = row.get("ssn", "")
+        if cols.get("name"):    values[cols["name"] - 1]   = row.get("employee", "")
+        if cols.get("status"):  values[cols["status"] - 1] = row.get("Status", "A")
+        if cols.get("type"):    values[cols["type"] - 1]   = row.get("Type", "H")
+        if cols.get("rate"):    values[cols["rate"] - 1]   = row.get("rate", 0.0)
+        if cols.get("dept"):    values[cols["dept"] - 1]   = row.get("department", "")
+        if cols.get("a01"):     values[cols["a01"] - 1]    = row.get("REG", 0.0)
+        if cols.get("a02"):     values[cols["a02"] - 1]    = row.get("OT", 0.0)
+        if cols.get("a03"):     values[cols["a03"] - 1]    = row.get("DT", 0.0)
+
+        # Money columns if present
+        if cols.get("reg$"):    values[cols["reg$"] - 1]   = row.get("REG_$", 0.0)
+        if cols.get("ot$"):     values[cols["ot$"] - 1]    = row.get("OT_$", 0.0)
+        if cols.get("dt$"):     values[cols["dt$"] - 1]    = row.get("DT_$", 0.0)
+        if cols.get("total$"):  values[cols["total$"] - 1] = row.get("TOTAL_$", 0.0)
+
+        # If there is no explicit TOTAL $ column, populate the far-right 'Total' if present
+        if not cols.get("total$") and cols.get("total"):
+            values[cols["total"] - 1] = row.get("TOTAL_$", 0.0)
+
         ws.append(values)
 
     # Spacer + TOTAL row
     ws.append([])
     totals = {
-        "REG": float(weekly["REG"].sum()),
-        "OT":  float(weekly["OT"].sum()),
-        "DT":  float(weekly["DT"].sum()),
-        "REG_$": float(weekly["REG_$"].sum()),
-        "OT_$":  float(weekly["OT_$"].sum()),
-        "DT_$":  float(weekly["DT_$"].sum()),
+        "REG":     float(weekly["REG"].sum()),
+        "OT":      float(weekly["OT"].sum()),
+        "DT":      float(weekly["DT"].sum()),
+        "REG_$":   float(weekly["REG_$"].sum()),
+        "OT_$":    float(weekly["OT_$"].sum()),
+        "DT_$":    float(weekly["DT_$"].sum()),
         "TOTAL_$": float(weekly["TOTAL_$"].sum()),
     }
-    row_vals = [""] * max(ws.max_column, 20)
-    if cols.get("name")  : row_vals[cols["name"]-1]   = "TOTAL"
-    if cols.get("a01")   : row_vals[cols["a01"]-1]    = _money(totals["REG"])
-    if cols.get("a02")   : row_vals[cols["a02"]-1]    = _money(totals["OT"])
-    if cols.get("a03")   : row_vals[cols["a03"]-1]    = _money(totals["DT"])
-    if cols.get("reg$")  : row_vals[cols["reg$"]-1]   = _money(totals["REG_$"])
-    if cols.get("ot$")   : row_vals[cols["ot$"]-1]    = _money(totals["OT_$"])
-    if cols.get("dt$")   : row_vals[cols["dt$"]-1]    = _money(totals["DT_$"])
-    if cols.get("total$"): row_vals[cols["total$"]-1] = _money(totals["TOTAL_$"])
+    row_vals = [""] * max(ws.max_column, 64)
+    if cols.get("name"):   row_vals[cols["name"] - 1]  = "TOTAL"
+    if cols.get("a01"):    row_vals[cols["a01"] - 1]   = _money(totals["REG"])
+    if cols.get("a02"):    row_vals[cols["a02"] - 1]   = _money(totals["OT"])
+    if cols.get("a03"):    row_vals[cols["a03"] - 1]   = _money(totals["DT"])
+    if cols.get("reg$"):   row_vals[cols["reg$"] - 1]  = _money(totals["REG_$"])
+    if cols.get("ot$"):    row_vals[cols["ot$"] - 1]   = _money(totals["OT_$"])
+    if cols.get("dt$"):    row_vals[cols["dt$"] - 1]   = _money(totals["DT_$"])
+    # Prefer explicit TOTAL $; otherwise, fill far-right 'Total' if available
+    if cols.get("total$"):
+        row_vals[cols["total$"] - 1] = _money(totals["TOTAL_$"])
+    elif cols.get("total"):
+        row_vals[cols["total"] - 1] = _money(totals["TOTAL_$"])
     ws.append(row_vals)
 
-    # MissingSSN sheet (non-blocking)
-    try:
-        missing_rows = [r for r in weekly.to_dict(orient="records")
-                        if str(r.get("ssn","")).strip() in ("", "nan", "None")]
-        if missing_rows:
-            if "MissingSSN" in wb.sheetnames:
-                del wb["MissingSSN"]
-            ws_m = wb.create_sheet("MissingSSN")
-            cols_m = ["Employee Name","Dept","Type","Pay Rate","REG","OT","DT","REG_$","OT_$","DT_$","TOTAL_$"]
-            ws_m.append(cols_m)
-            for r in missing_rows:
-                ws_m.append([
-                    r.get("employee",""),
-                    r.get("department",""),
-                    r.get("Type",""),
-                    r.get("rate",""),
-                    r.get("REG",""),
-                    r.get("OT",""),
-                    r.get("DT",""),
-                    r.get("REG_$",""),
-                    r.get("OT_$",""),
-                    r.get("DT_$",""),
-                    r.get("TOTAL_$",""),
-                ])
-    except Exception:
-        pass
-
+    # ONE sheet only. No extra tabs.
     bio = io.BytesIO()
     wb.save(bio); bio.seek(0)
     return bio.read()
