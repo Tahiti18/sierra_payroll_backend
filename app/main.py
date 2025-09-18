@@ -12,11 +12,11 @@ from starlette.responses import StreamingResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="3.0.4")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # tighten for prod if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,7 +24,7 @@ app.add_middleware(
 
 ALLOWED_EXTS = (".xlsx", ".xls")
 
-# ---- WBS template layout (1-based columns) ----
+# =====================  WBS template layout (1-based)  ======================
 WBS_DATA_START_ROW = 9
 COL = {
     "EMP_ID": 1, "SSN": 2, "EMP_NAME": 3, "STATUS": 4, "TYPE": 5, "PAY_RATE": 6, "DEPT": 7,
@@ -33,10 +33,11 @@ COL = {
     "ATE": 26, "COMMENTS": 27, "TOTALS": 28,
 }
 
-ROSTER_SHEET_NAME = "Roster"
-PIECEWORK_SHEET_NAME = "Piecework"
+ROSTER_FILE = "roster.xlsx"          # repo root
+ROSTER_SHEET_NAME = None             # or set a specific sheet name if needed
+PIECEWORK_SHEET_NAME = "Piecework"   # optional tab in Sierra file
 
-# ---------------- helpers ----------------
+# ===============================  Helpers  ==================================
 def _std(s: str) -> str:
     return (s or "").strip().lower().replace("\n", " ").replace("\r", " ")
 
@@ -87,7 +88,18 @@ def _safe_float(x) -> float:
     try: return float(x)
     except Exception: return 0.0
 
-# -------------- core conversion --------------
+def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = { _std(c): c for c in df.columns }
+    for w in candidates:
+        k = _std(w)
+        if k in cols: return cols[k]
+    for w in candidates:
+        k = _std(w)
+        for kk, vv in cols.items():
+            if k in kk: return vv
+    return None
+
+# ============================  Core Conversion  =============================
 def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) -> bytes:
     xls = pd.ExcelFile(io.BytesIO(input_bytes))
     main_sheet = sheet_name or xls.sheet_names[0]
@@ -95,7 +107,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     if df_in.empty:
         raise ValueError("Input sheet is empty.")
 
-    # header mapping
+    # Sierra header mapping
     hdr = {
         "name":  ["employee", "employee name", "name", "worker", "employee_name"],
         "date":  ["date", "day", "work date", "worked date", "days"],
@@ -105,17 +117,6 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         "ssn":   ["ssn", "social", "social security"],
         "type":  ["type", "emp type", "employee type", "pay type"],
     }
-
-    def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-        cols = { _std(c): c for c in df.columns }
-        for w in candidates:
-            k = _std(w)
-            if k in cols: return cols[k]
-        for w in candidates:
-            k = _std(w)
-            for kk, vv in cols.items():
-                if k in kk: return vv
-        return None
 
     c_name  = _find_col(df_in, hdr["name"])
     c_date  = _find_col(df_in, hdr["date"])
@@ -129,6 +130,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         if not col:
             raise ValueError(f"Missing required column: {req}")
 
+    # Normalize
     core = df_in[[c_name, c_date, c_hours, c_rate]].copy()
     core.columns = ["employee", "date", "hours", "rate"]
     core["dept"]  = df_in[c_dept] if c_dept else ""
@@ -144,30 +146,6 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     if core.empty:
         raise ValueError("No valid rows after cleaning (check Employee/Date/Hours/Days).")
 
-    # Optional roster enrichment
-    roster = {}
-    if ROSTER_SHEET_NAME in xls.sheet_names:
-        try:
-            r = xls.parse(ROSTER_SHEET_NAME)
-            rn = _find_col(r, ["employee", "employee name", "name"])
-            if rn:
-                r[rn] = r[rn].astype(str).map(_normalize_name)
-                ssn_col = _find_col(r, ["ssn"])
-                dep_col = _find_col(r, ["department","dept"])
-                typ_col = _find_col(r, ["type","emp type"])
-                pr_col  = _find_col(r, ["pay rate","rate","salary"])
-                for _, row in r.iterrows():
-                    emp = _normalize_name(row.get(rn, ""))
-                    if not emp: continue
-                    roster[emp] = {
-                        "ssn": str(row.get(ssn_col, "") or "") if ssn_col else "",
-                        "dept": str(row.get(dep_col, "") or "") if dep_col else "",
-                        "type": str(row.get(typ_col, "") or "") if typ_col else "",
-                        "rate": float(row.get(pr_col, 0.0) or 0.0) if pr_col else 0.0,
-                    }
-        except Exception:
-            pass
-
     # Optional piecework totals by weekday
     piece_totals = defaultdict(lambda: defaultdict(float))  # emp -> wd -> amount
     if PIECEWORK_SHEET_NAME in xls.sheet_names:
@@ -181,13 +159,16 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
                 for _, row in pw.iterrows():
                     emp = _normalize_name(row.get(rn, ""))
                     wd  = _weekday_from_any(row.get(dn))
-                    amt = _safe_float(row.get(an, 0))
+                    try:
+                        amt = float(row.get(an, 0) or 0)
+                    except Exception:
+                        amt = 0.0
                     if emp and wd and 1 <= wd <= 5:
                         piece_totals[emp][wd] += amt
         except Exception:
             pass
 
-    # Aggregate hours and metadata
+    # Aggregate per day then weekly
     per_emp_day = core.groupby(["employee","wd"]).agg({
         "hours":"sum",
         "rate": list,
@@ -214,8 +195,32 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
 
     employees = sorted(weekly_hours.keys(), key=lambda e: (str(emp_dept.get(e,"")), e))
 
-    # Load WBS template from repo root (app/ is one level down)
+    # ----------------- Enrich from roster.xlsx (repo root) ------------------
     here = Path(__file__).resolve().parent
+    roster_path = here.parent / ROSTER_FILE
+    roster_map: Dict[str, Dict[str, str]] = {}
+    if roster_path.exists():
+        try:
+            rdf = pd.read_excel(roster_path, sheet_name=ROSTER_SHEET_NAME)
+            name_col = _find_col(rdf, ["employee","employee name","name"])
+            ssn_col  = _find_col(rdf, ["ssn","social","social security","social security number"])
+            dept_col = _find_col(rdf, ["department","dept","division"])
+            rate_col = _find_col(rdf, ["rate","pay rate","hourly rate","wage","salary"])
+            if name_col:
+                for _, rr in rdf.iterrows():
+                    key = _normalize_name(rr.get(name_col, ""))
+                    if not key: continue
+                    ssn  = str(rr.get(ssn_col, "") or "") if ssn_col else ""
+                    dept = str(rr.get(dept_col, "") or "") if dept_col else ""
+                    try:
+                        rrate = float(rr.get(rate_col, 0) or 0) if rate_col else 0.0
+                    except Exception:
+                        rrate = 0.0
+                    roster_map[key] = {"ssn": ssn, "dept": dept, "rate": rrate}
+        except Exception:
+            roster_map = {}
+
+    # ------------------------ Load WBS template ----------------------------
     template_path = here.parent / "wbs_template.xlsx"
     if not template_path.exists():
         raise HTTPException(status_code=500, detail=f"WBS template not found at {template_path}")
@@ -223,21 +228,21 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     wb = load_workbook(str(template_path))
     ws = wb.active
 
-    # Clear existing data rows but keep styles; skip merged cells (read-only)
+    # -------------------- Clear old rows (skip merged) ---------------------
     max_row = ws.max_row
     if max_row >= WBS_DATA_START_ROW:
         for r in range(WBS_DATA_START_ROW, max_row + 1):
+            # row already blank? skip
             if all((ws.cell(row=r, column=c).value in (None, "")) for c in range(1, COL["TOTALS"] + 1)):
                 continue
             for c in range(1, COL["TOTALS"] + 1):
                 try:
-                    cell = ws.cell(row=r, column=c)
-                    cell.value = None
+                    ws.cell(row=r, column=c).value = None
                 except AttributeError:
                     # merged cells are read-only in openpyxl; skip them
                     continue
 
-    # Write employees
+    # ----------------------- Write employee rows ---------------------------
     current_row = WBS_DATA_START_ROW
     for emp in employees:
         ssn  = emp_ssn.get(emp, "") or ""
@@ -245,11 +250,12 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         typ  = str(emp_type.get(emp, "") or "").upper()
         rate_modal = _mode(emp_rates.get(emp, []))
 
-        if emp in roster:
-            if roster[emp].get("ssn"):  ssn  = roster[emp]["ssn"]
-            if roster[emp].get("dept"): dept = roster[emp]["dept"].upper()
-            if roster[emp].get("type"): typ  = roster[emp]["type"].upper()
-            if roster[emp].get("rate", 0) > 0: rate_modal = float(roster[emp]["rate"])
+        # roster overrides
+        if emp in roster_map:
+            r = roster_map[emp]
+            if not ssn and r.get("ssn"): ssn = r["ssn"]
+            if not dept and r.get("dept"): dept = str(r["dept"]).upper()
+            if (rate_modal == 0.0) and r.get("rate", 0) > 0: rate_modal = float(r["rate"])
 
         if typ not in ("H", "S"):
             typ = "S" if rate_modal >= 1000 else "H"
@@ -270,6 +276,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         ws.cell(row=current_row, column=COL["A02"]).value = round(a02, 2)
         ws.cell(row=current_row, column=COL["A03"]).value = round(a03, 2)
 
+        # zero or blank for unused codes
         for key in ("A06","A07","A08","A04","A05"):
             ws.cell(row=current_row, column=COL[key]).value = None
 
@@ -280,21 +287,22 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         ws.cell(row=current_row, column=COL["ATE"]).value = None
         ws.cell(row=current_row, column=COL["COMMENTS"]).value = None
 
-        # totals formula per employee row
-        c = lambda key: get_column_letter(COL[key])
-        pr, a01c, a02c, a03c = (f"{c('PAY_RATE')}{current_row}", f"{c('A01')}{current_row}",
-                                f"{c('A02')}{current_row}", f"{c('A03')}{current_row}")
-        ai_sum = f"SUM({c('AI1')}{current_row}:{c('AI5')}{current_row})"
-        atec = f"{c('ATE')}{current_row}"
+        # --------- Totals formula to match WBS exactly (Hourly vs Salaried)
+        # F = Pay Rate, H = A01, I = A02, J = A03, K = A06, L = A07,
+        # N = A04, O = A05, Q/S/U/W/Y = AI1..AI5, Z = ATE
+        r = current_row
         if typ == "S":
-            formula = f"IFERROR({pr} + {ai_sum} + IF({atec}=\"\",0,{atec}), 0)"
+            totals_formula = f"=(F{r}/40*H{r})+(F{r}/40*K{r})+(F{r}/40*L{r})+N{r}+O{r}"
         else:
-            formula = f"IFERROR(({a01c} + 1.5*{a02c} + 2*{a03c})*{pr} + {ai_sum} + IF({atec}=\"\",0,{atec}), 0)"
-        ws.cell(row=current_row, column=COL["TOTALS"]).value = f"={formula}"
+            totals_formula = (
+                f"=(F{r}*H{r})+(F{r}*I{r})+(F{r}*J{r})+(F{r}*K{r})+(F{r}*L{r})+"
+                f"Q{r}+S{r}+U{r}+W{r}+Y{r}+Z{r}"
+            )
+        ws.cell(row=current_row, column=COL["TOTALS"]).value = f"={totals_formula}"
 
         current_row += 1
 
-    # Totals row (sum)
+    # ---------------------------- Totals row -------------------------------
     last_data_row = current_row - 1
     if last_data_row >= WBS_DATA_START_ROW:
         totals_row = current_row
@@ -309,7 +317,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     out.seek(0)
     return out.read()
 
-# --------------- routes ---------------
+# ================================  API  =====================================
 @app.get("/health")
 def health():
     return JSONResponse({"ok": True, "ts": datetime.utcnow().isoformat() + "Z"})
@@ -327,7 +335,7 @@ async def process_payroll(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         out_bytes = convert_sierra_to_wbs(contents, sheet_name=None)
-        out_name = f"WBS Payroll {datetime.utcnow().date().isoformat()}.xlsx"
+        out_name = f"WBS_Payroll_{datetime.utcnow().date().isoformat()}.xlsx"
         return StreamingResponse(
             io.BytesIO(out_bytes),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
