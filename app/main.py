@@ -13,13 +13,13 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse, JSONResponse
 
-from app.services.wbs_generator import write_into_wbs_template  # <- our writer only
+from app.services.wbs_generator import write_into_wbs_template  # writer for WEEKLY tab only
 
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="8.0.0")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="8.0.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -103,6 +103,7 @@ def _load_template_bytes() -> bytes:
     return p.read_bytes()
 
 def _load_roster_df() -> Optional[pd.DataFrame]:
+    """Load roster.xlsx or roster.csv if present. All columns optional; SSN may be blank."""
     p = _find_file(["roster.xlsx", "roster.csv"])
     if not p:
         return None
@@ -116,7 +117,6 @@ def _load_roster_df() -> Optional[pd.DataFrame]:
     if df.empty:
         return None
 
-    # Map columns
     def find_col(options: List[str]) -> Optional[str]:
         norm = {_std(c): c for c in df.columns}
         for want in options:
@@ -230,17 +230,24 @@ def _ca_daily_ot(h: float) -> Dict[str, float]:
     return {"REG": reg, "OT": ot, "DT": dt}
 
 def _build_weekly(sierra_bytes: bytes) -> pd.DataFrame:
+    # Read first sheet
     excel = pd.ExcelFile(io.BytesIO(sierra_bytes))
     sheet = excel.sheet_names[0]
     df = excel.parse(sheet)
 
-    # roster (optional)
+    # Roster (optional)
     roster = _load_roster_df()
     rate_map = {}
+    ssn_map  = {}
+    dept_map = {}
+    type_map = {}
     if roster is not None and not roster.empty:
         rate_map = {k: float(v) for k, v in zip(roster["employee_key"], roster["rate_roster"]) if pd.notna(v)}
+        ssn_map  = {k: (s or "") for k, s in zip(roster["employee_key"], roster["ssn"])}
+        dept_map = {k: (d or "") for k, d in zip(roster["employee_key"], roster["department_roster"])}
+        type_map = {k: (t or "") for k, t in zip(roster["employee_key"], roster["wtype_roster"])}
 
-    # base columns
+    # Base columns
     emp_col  = _guess_employee_col(df)
     rate_col = _guess_rate_col(df)  # optional; fallback to roster
     if not emp_col:
@@ -341,7 +348,7 @@ def _build_weekly(sierra_bytes: bytes) -> pd.DataFrame:
         wtyp = str(g["wtype"].dropna().astype(str).replace("nan","").iloc[0] if not g.empty else "")
         first_type[k]  = "S" if wtyp.upper().startswith("S") else "H"
 
-    # split daily hours into REG/OT/DT (CA-like split)
+    # split daily hours into REG/OT/DT (CA-like)
     parts = []
     for (k, emp, day), g in core.groupby(["emp_key","employee","date"], dropna=False):
         day_hours = float(g["hours"].sum())
@@ -377,9 +384,11 @@ def _build_weekly(sierra_bytes: bytes) -> pd.DataFrame:
 
     weekly["rate"]       = weekly["emp_key"].map(lambda k: _money(chosen_rate.get(k, 0.0)))
     weekly["department"] = weekly["emp_key"].map(lambda k: first_dept.get(k, ""))
-    weekly["ssn"]        = ""   # optional from roster
     weekly["Status"]     = "A"
     weekly["Type"]       = weekly["emp_key"].map(lambda k: first_type.get(k, "H"))
+
+    # <- SSN OPTIONAL (from roster if available; otherwise blank)
+    weekly["ssn"] = weekly["emp_key"].map(lambda k: ssn_map.get(k, "")).fillna("").astype(str)
 
     for c in ["REG","OT","DT"]:
         weekly[c] = weekly[c].map(_money)
@@ -389,7 +398,7 @@ def _build_weekly(sierra_bytes: bytes) -> pd.DataFrame:
         "REG","OT","DT","REG_$","OT_$","DT_$","TOTAL_$"
     ]].copy()
 
-    # Merge roster (best-effort only)
+    # Merge roster (best-effort only) to backfill blanks — never error on SSN
     if roster is not None and not roster.empty:
         w = weekly.copy()
         w["k_lf"]  = w["employee"].map(lambda s: ",".join(_name_parts(s)).lower())
@@ -397,17 +406,28 @@ def _build_weekly(sierra_bytes: bytes) -> pd.DataFrame:
         r["k_lf"]  = r["employee_disp"].map(lambda s: ",".join(_name_parts(s)).lower())
         m = w.merge(r[["k_lf","ssn","rate_roster","department_roster","wtype_roster"]],
                     on="k_lf", how="left")
-        # fill
-        m["ssn"]  = m["ssn"].fillna("")
+
+        # Fill SSN only if blank
+        m["ssn_x"] = m["ssn_x"].fillna("")
+        m["ssn_y"] = m["ssn_y"].fillna("")
+        m["ssn"] = m.apply(lambda row: row["ssn_x"] if str(row["ssn_x"]).strip() != "" else row["ssn_y"], axis=1)
+
+        # Fill other fields if missing
         m["rate"] = m.apply(lambda row: row["rate"] if row["rate"]>0 else _to_number(row.get("rate_roster")), axis=1)
         m["department"] = m.apply(lambda row: row["department"] if str(row["department"]).strip() not in ("","nan","None")
                                   else (row.get("department_roster") or ""), axis=1)
         m["Type"] = m.apply(lambda row: row["Type"] if str(row["Type"]).strip() not in ("","nan","None")
                             else ("S" if str(row.get("wtype_roster","")).upper().startswith("S") else "H"), axis=1)
-        m = m.drop(columns=["k_lf","rate_roster","department_roster","wtype_roster"])
+
+        m = m.drop(columns=["k_lf","ssn_x","ssn_y","rate_roster","department_roster","wtype_roster"])
         weekly = m
 
     weekly = weekly.drop(columns=["emp_key"])
+    # hard guarantee: SSN column exists and is string
+    if "ssn" not in weekly.columns:
+        weekly["ssn"] = ""
+    weekly["ssn"] = weekly["ssn"].fillna("").astype(str)
+
     return weekly
 
 
@@ -442,7 +462,6 @@ async def process_payroll(file: UploadFile = File(..., description="Sierra payro
         sierra_bytes = await file.read()
         weekly = _build_weekly(sierra_bytes)
     except HTTPException as he:
-        # Pass through, but guarantee string detail
         raise HTTPException(he.status_code, str(he.detail))
     except ValueError as ve:
         raise HTTPException(422, str(ve))
