@@ -12,7 +12,7 @@ from starlette.responses import StreamingResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Sierra → WBS Payroll Converter", version="3.0.2")
+app = FastAPI(title="Sierra → WBS Payroll Converter", version="3.0.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ app.add_middleware(
 
 ALLOWED_EXTS = (".xlsx", ".xls")
 
-# WBS template layout (columns are 1-based)
+# ---- WBS template layout (1-based columns) ----
 WBS_DATA_START_ROW = 9
 COL = {
     "EMP_ID": 1, "SSN": 2, "EMP_NAME": 3, "STATUS": 4, "TYPE": 5, "PAY_RATE": 6, "DEPT": 7,
@@ -95,6 +95,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     if df_in.empty:
         raise ValueError("Input sheet is empty.")
 
+    # header mapping
     hdr = {
         "name":  ["employee", "employee name", "name", "worker", "employee_name"],
         "date":  ["date", "day", "work date", "worked date", "days"],
@@ -143,7 +144,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     if core.empty:
         raise ValueError("No valid rows after cleaning (check Employee/Date/Hours/Days).")
 
-    # Optional: Roster sheet
+    # Optional roster enrichment
     roster = {}
     if ROSTER_SHEET_NAME in xls.sheet_names:
         try:
@@ -167,7 +168,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         except Exception:
             pass
 
-    # Optional: Piecework sheet
+    # Optional piecework totals by weekday
     piece_totals = defaultdict(lambda: defaultdict(float))  # emp -> wd -> amount
     if PIECEWORK_SHEET_NAME in xls.sheet_names:
         try:
@@ -186,7 +187,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
         except Exception:
             pass
 
-    # Aggregate
+    # Aggregate hours and metadata
     per_emp_day = core.groupby(["employee","wd"]).agg({
         "hours":"sum",
         "rate": list,
@@ -213,7 +214,7 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
 
     employees = sorted(weekly_hours.keys(), key=lambda e: (str(emp_dept.get(e,"")), e))
 
-    # Load WBS template from repo root (since app/main.py is in app/)
+    # Load WBS template from repo root (app/ is one level down)
     here = Path(__file__).resolve().parent
     template_path = here.parent / "wbs_template.xlsx"
     if not template_path.exists():
@@ -222,21 +223,21 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     wb = load_workbook(str(template_path))
     ws = wb.active
 
-    # Clear existing data rows but keep styles
-max_row = ws.max_row
-if max_row >= WBS_DATA_START_ROW:
-    for r in range(WBS_DATA_START_ROW, max_row + 1):
-        if all((ws.cell(row=r, column=c).value in (None, "")) for c in range(1, COL["TOTALS"] + 1)):
-            continue
-        for c in range(1, COL["TOTALS"] + 1):
-            try:
-                cell = ws.cell(row=r, column=c)
-                cell.value = None
-            except AttributeError:
-                # merged cells are read-only in openpyxl; skip them
+    # Clear existing data rows but keep styles; skip merged cells (read-only)
+    max_row = ws.max_row
+    if max_row >= WBS_DATA_START_ROW:
+        for r in range(WBS_DATA_START_ROW, max_row + 1):
+            if all((ws.cell(row=r, column=c).value in (None, "")) for c in range(1, COL["TOTALS"] + 1)):
                 continue
+            for c in range(1, COL["TOTALS"] + 1):
+                try:
+                    cell = ws.cell(row=r, column=c)
+                    cell.value = None
+                except AttributeError:
+                    # merged cells are read-only in openpyxl; skip them
+                    continue
 
-    # Write rows
+    # Write employees
     current_row = WBS_DATA_START_ROW
     for emp in employees:
         ssn  = emp_ssn.get(emp, "") or ""
@@ -279,6 +280,7 @@ if max_row >= WBS_DATA_START_ROW:
         ws.cell(row=current_row, column=COL["ATE"]).value = None
         ws.cell(row=current_row, column=COL["COMMENTS"]).value = None
 
+        # totals formula per employee row
         c = lambda key: get_column_letter(COL[key])
         pr, a01c, a02c, a03c = (f"{c('PAY_RATE')}{current_row}", f"{c('A01')}{current_row}",
                                 f"{c('A02')}{current_row}", f"{c('A03')}{current_row}")
@@ -292,6 +294,7 @@ if max_row >= WBS_DATA_START_ROW:
 
         current_row += 1
 
+    # Totals row (sum)
     last_data_row = current_row - 1
     if last_data_row >= WBS_DATA_START_ROW:
         totals_row = current_row
@@ -331,12 +334,10 @@ async def process_payroll(file: UploadFile = File(...)):
             headers={"Content-Disposition": f'attachment; filename="{out_name}"'}
         )
     except ValueError as ve:
-        # show precise validation failures to frontend and logs
         import traceback, sys
         traceback.print_exc(file=sys.stderr)
         raise HTTPException(status_code=422, detail=str(ve))
     except Exception as e:
-        # print full traceback to Railway logs and surface message
         import traceback, sys
         traceback.print_exc(file=sys.stderr)
         raise HTTPException(status_code=500, detail=f"backend processing failed: {e}")
