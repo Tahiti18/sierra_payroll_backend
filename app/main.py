@@ -1,558 +1,470 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-  <title>Sierra Roofing - Payroll Automation System (Debug)</title>
-  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
-  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
-  <style>
-    .sierra-blue { background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); }
-    .sierra-accent { color: #f59e0b; }
-    .upload-zone { border: 2px dashed #d1d5db; transition: all 0.3s ease; }
-    .upload-zone:hover, .upload-zone.dragover { border-color: #3b82f6; background-color: #eff6ff; }
-    .progress-bar { transition: width 0.3s ease; }
-    .modal-overlay { background-color: rgba(0, 0, 0, 0.5); backdrop-filter: blur(4px); }
-    .btn-primary { background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); transition: all 0.3s ease; }
-    .btn-primary:hover { background: linear-gradient(135deg, #1e40af 0%, #2563eb 100%); transform: translateY(-1px); }
-    .card-shadow { box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06); }
-    .sierra-logo { font-family: 'Arial Black', sans-serif; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
-    .debug-console { background: #1f2937; color: #f3f4f6; font-family: 'Courier New', monospace; font-size: 12px; max-height: 300px; overflow-y: auto; }
-    .status-online { color: #10b981; } .status-offline { color: #ef4444; } .status-testing { color: #f59e0b; }
-    .debug-toggle { position: fixed; top: 20px; right: 20px; z-index: 1000; }
-  </style>
-</head>
-<body class="bg-gray-50 min-h-screen">
-  <div id="root"></div>
+# server/main.py
+import io, os, re, unicodedata
+from pathlib import Path
+from datetime import datetime, date
+from typing import Optional, List, Dict, Tuple
 
-  <script>
-    const { useState, useEffect, useRef } = React;
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import StreamingResponse, JSONResponse
+from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
 
-    // ---- Debug logger (in-memory, and on screen) ----
-    const debugLog = (setLogs) => (message, data = null, type = 'info') => {
-      const timestamp = new Date().toLocaleTimeString();
-      const entry = { timestamp, message, data, type };
-      console[type === 'error' ? 'error' : (type === 'success' ? 'log' : 'log')](
-        `[${timestamp}] ${type.toUpperCase()}: ${message}`, data || ''
-      );
-      setLogs(prev => {
-        const next = [...prev, entry];
-        return next.length > 300 ? next.slice(-300) : next;
-      });
-    };
+app = FastAPI(title="Sierra → WBS (weekly-40, numbers-first)", version="9.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    // ---- Simple fetch with 120s timeout and clear error text ----
-    async function timedFetch(url, options = {}, timeoutMs = 120000) {
-      const ac = new AbortController();
-      const t = setTimeout(() => ac.abort(), timeoutMs);
-      try {
-        const res = await fetch(url, { ...options, signal: ac.signal, mode: 'cors', credentials: 'omit' });
-        return res;
-      } finally {
-        clearTimeout(t);
-      }
+BASE_DIR = Path(__file__).resolve().parents[1]
+SEARCH_DIRS = [BASE_DIR, BASE_DIR / "app", BASE_DIR / "server", BASE_DIR / "app" / "data"]
+ALLOWED_EXTS = (".xlsx", ".xls")
+
+# ---------- helpers ----------
+def _std(s: str) -> str:
+    return (s or "").strip().lower().replace("\n", " ").replace("\r", " ")
+
+def _ext_ok(name: str) -> bool:
+    n = (name or "").lower()
+    return any(n.endswith(e) for e in ALLOWED_EXTS)
+
+def _clean_space(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s).strip())
+
+def _canon_name(s: str) -> str:
+    s = _clean_space(s)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.replace(".", "")
+    s = re.sub(r"\s*,\s*", ",", s)
+    return s.lower()
+
+def _to_number(x) -> float:
+    if x is None or (isinstance(x, float) and pd.isna(x)): return 0.0
+    s = str(x).strip()
+    if s == "" or s.lower() in ("nan", "none"): return 0.0
+    s = re.sub(r"[^0-9\.\-]", "", s)
+    try:
+        return float(s) if s not in ("", "-", ".", "-.") else 0.0
+    except Exception:
+        try: return float(x)
+        except Exception: return 0.0
+
+def _money(x: float) -> float:
+    try: return round(float(x or 0.0), 2)
+    except Exception: return 0.0
+
+def _find_file(basenames: List[str]) -> Optional[Path]:
+    env_map = {"wbs_template.xlsx": "WBS_TEMPLATE_PATH", "roster.xlsx": "ROSTER_PATH", "roster.csv": "ROSTER_PATH"}
+    for name in basenames:
+        env_key = env_map.get(name)
+        if env_key:
+            p = os.getenv(env_key)
+            if p and Path(p).exists():
+                return Path(p)
+    for d in SEARCH_DIRS:
+        for name in basenames:
+            p = d / name
+            if p.exists():
+                return p
+    return None
+
+def _load_template_bytes() -> bytes:
+    p = _find_file(["wbs_template.xlsx"])
+    if not p:
+        raise HTTPException(422, "WBS template not found. Place 'wbs_template.xlsx' at repo root or set WBS_TEMPLATE_PATH.")
+    return p.read_bytes()
+
+def _load_roster_df() -> Optional[pd.DataFrame]:
+    p = _find_file(["roster.xlsx", "roster.csv"])
+    if not p: return None
+    try:
+        if p.suffix.lower() == ".xlsx":
+            df = pd.read_excel(p, dtype=str)
+        else:
+            df = pd.read_csv(p, dtype=str)
+    except Exception as e:
+        raise HTTPException(422, f"Roster load failed: {e}")
+    if df.empty: return None
+
+    def find_col(options: List[str]) -> Optional[str]:
+        norm = {_std(c): c for c in df.columns}
+        for want in options:
+            w = _std(want)
+            if w in norm: return norm[w]
+        for want in options:
+            w = _std(want)
+            for k, c in norm.items():
+                if w in k: return c
+        return None
+
+    name_col = find_col(["employee name", "employee", "name"])
+    ssn_col  = find_col(["ssn", "social", "social security"])
+    rate_col = find_col(["payrate", "rate", "hourly rate", "wage"])
+    dept_col = find_col(["dept", "department", "division"])
+    type_col = find_col(["type", "employee type", "emp type"])
+
+    if not name_col: return None
+
+    out = pd.DataFrame({
+        "employee_disp": df[name_col].astype(str).map(_clean_space),
+        "employee_key":  df[name_col].astype(str).map(_canon_name),
+        "ssn":           (df[ssn_col].astype(str).map(str.strip) if ssn_col else pd.Series([""]*len(df))),
+        "rate_roster":   pd.to_numeric(df[rate_col].map(_to_number), errors="coerce") if rate_col else pd.Series([None]*len(df)),
+        "department_roster": df[dept_col].astype(str).map(str.strip) if dept_col else pd.Series([""]*len(df)),
+        "wtype_roster":      df[type_col].astype(str).map(str.strip) if type_col else pd.Series([""]*len(df)),
+    }).dropna(subset=["employee_key"]).drop_duplicates(subset=["employee_key"], keep="last")
+
+    return out
+
+# ---------- Sierra parsing (weekly-40) ----------
+COMMON_EMP  = ["employee", "employee name", "name"]
+COMMON_DATE = ["date", "work date", "day"]
+COMMON_HRS  = ["hours", "hrs", "total hours", "a01", "regular", "reg"]
+COMMON_RATE = ["rate", "pay rate", "hourly rate", "wage", "base rate"]
+
+def _guess_col(df: pd.DataFrame, options: List[str]) -> Optional[str]:
+    norm = {_std(c): c for c in df.columns}
+    for want in options:
+        w = _std(want)
+        if w in norm: return norm[w]
+    for want in options:
+        w = _std(want)
+        for k, c in norm.items():
+            if w in k: return c
+    return None
+
+def _guess_employee_col(df: pd.DataFrame) -> Optional[str]:
+    c = _guess_col(df, COMMON_EMP)
+    if c: return c
+    best, score = None, -1
+    for col in df.columns:
+        s = df[col].astype(str)
+        looks = s.str.contains(r"[A-Za-z],\s*[A-Za-z]", regex=True, na=False).mean()
+        if looks > score:
+            best, score = col, looks
+    return best if score >= 0.2 else None
+
+def _guess_date_col(df: pd.DataFrame) -> Optional[str]:
+    c = _guess_col(df, COMMON_DATE)
+    if c: return c
+    best, score = None, -1
+    for col in df.columns:
+        try:
+            sc = pd.to_datetime(df[col], errors="coerce").notna().mean()
+            if sc > score:
+                score, best = sc, col
+        except Exception:
+            continue
+    return best if score >= 0.3 else None
+
+def _guess_hours_col(df: pd.DataFrame) -> Optional[str]:
+    c = _guess_col(df, COMMON_HRS)
+    if c: return c
+    best, score = None, -1
+    for col in df.columns:
+        try:
+            v = pd.to_numeric(df[col].map(_to_number), errors="coerce")
+        except Exception:
+            continue
+        ok = v.between(0, 24, inclusive="both").mean()
+        nz = (v > 0).mean()
+        sc = ok * 0.6 + nz * 0.4
+        if sc > score:
+            best, score = col, sc
+    return best if score >= 0.3 else None
+
+def _weekly40(hours_total: float) -> Dict[str, float]:
+    h = float(hours_total or 0.0)
+    reg = min(h, 40.0)
+    ot  = max(h - 40.0, 0.0)
+    dt  = 0.0
+    return {"REG": reg, "OT": ot, "DT": dt}
+
+def build_weekly_from_sierra(xlsx_bytes: bytes) -> pd.DataFrame:
+    excel = pd.ExcelFile(io.BytesIO(xlsx_bytes))
+    sheet = excel.sheet_names[0]
+    df = excel.parse(sheet)
+
+    roster = _load_roster_df()
+    rate_map = { } ; ssn_map = { } ; dept_map = { } ; type_map = { }
+    if roster is not None and not roster.empty:
+        rate_map = {k: float(v) for k, v in zip(roster["employee_key"], roster["rate_roster"]) if pd.notna(v)}
+        ssn_map  = {k: (s or "") for k, s in zip(roster["employee_key"], roster["ssn"])}
+        dept_map = {k: (d or "") for k, d in zip(roster["employee_key"], roster["department_roster"])}
+        type_map = {k: (t or "") for k, t in zip(roster["employee_key"], roster["wtype_roster"])}
+
+    emp_col  = _guess_employee_col(df)
+    if not emp_col:
+        raise ValueError("Could not find 'Employee' column in Sierra file.")
+    rate_col = _guess_col(df, COMMON_RATE)  # optional
+    dep_col  = _guess_col(df, ["department","dept","division"])
+    typ_col  = _guess_col(df, ["type","employee type","emp type","pay type"])
+
+    employee = df[emp_col].astype(str).map(_clean_space)
+    emp_key  = employee.map(_canon_name)
+    raw_rate = df[rate_col].map(_to_number) if rate_col else pd.Series([0.0]*len(df))
+    rate = []
+    for k, r in zip(emp_key, raw_rate):
+        v = float(r or 0.0)
+        if v <= 0 and k in rate_map: v = float(rate_map[k] or 0.0)
+        rate.append(v)
+    rate = pd.Series(rate, dtype=float)
+
+    base = pd.DataFrame({
+        "employee":   employee,
+        "emp_key":    emp_key,
+        "rate":       rate.astype(float),
+        "department": (df[dep_col].astype(str).map(str.strip) if dep_col else ""),
+        "wtype":      (df[typ_col].astype(str).map(str.strip) if typ_col else ""),
+    })
+
+    date_col = _guess_date_col(df)
+    hrs_col  = _guess_hours_col(df)
+    has_date_hours = bool(date_col and hrs_col)
+
+    day_candidates = [
+        ("mon", ["mon","monday"]),("tue", ["tue","tues","tuesday"]),("wed", ["wed","weds","wednesday"]),
+        ("thu", ["thu","thur","thurs","thursday"]),("fri", ["fri","friday"]),("sat", ["sat","saturday"]),("sun", ["sun","sunday"]),
+    ]
+    day_cols: Dict[str,str] = {}
+    normcols = { _std(c): c for c in df.columns }
+    for day_key, aliases in day_candidates:
+        for alias in aliases:
+            for k,c in normcols.items():
+                if alias in k:
+                    day_cols[day_key] = c
+                    break
+            if day_key in day_cols: break
+    has_weekdays = len(day_cols) >= 4
+
+    if not has_date_hours and not has_weekdays:
+        raise ValueError("Could not find Date+Hours or weekday (Mon..Sun) columns in Sierra file.")
+
+    if has_date_hours:
+        rows = pd.DataFrame({
+            "emp_key":    base["emp_key"],
+            "employee":   base["employee"],
+            "hours":      pd.to_numeric(df[hrs_col].map(_to_number), errors="coerce").fillna(0.0).astype(float),
+            "rate":       base["rate"],
+            "department": base["department"],
+            "wtype":      base["wtype"],
+        })
+    else:
+        hrs_sum = pd.Series([0.0]*len(df), dtype=float)
+        for _, col in day_cols.items():
+            hrs_sum = hrs_sum + pd.to_numeric(df[col].map(_to_number), errors="coerce").fillna(0.0).astype(float)
+        rows = pd.DataFrame({
+            "emp_key":    base["emp_key"],
+            "employee":   base["employee"],
+            "hours":      hrs_sum,
+            "rate":       base["rate"],
+            "department": base["department"],
+            "wtype":      base["wtype"],
+        })
+
+    by_emp = rows.groupby(["emp_key","employee"], as_index=False).agg(
+        HOURS=("hours","sum"),
+        RATE=("rate","max"),
+        DEPARTMENT=("department","first"),
+        WTYPE=("wtype","first"),
+    )
+
+    b = by_emp["HOURS"].map(_weekly40)
+    by_emp["REG"] = b.map(lambda d: d["REG"]).astype(float)
+    by_emp["OT"]  = b.map(lambda d: d["OT"]).astype(float)
+    by_emp["DT"]  = 0.0
+
+    def _final_rate(row):
+        rr = float(row["RATE"] or 0.0)
+        if rr <= 0.0: return float(rate_map.get(row["emp_key"], 0.0))
+        return rr
+    by_emp["rate"] = by_emp.apply(_final_rate, axis=1).astype(float)
+
+    by_emp["REG_$"]   = by_emp["REG"] * by_emp["rate"]
+    by_emp["OT_$"]    = by_emp["OT"]  * by_emp["rate"] * 1.5
+    by_emp["DT_$"]    = by_emp["DT"]  * by_emp["rate"] * 2.0
+    by_emp["TOTAL_$"] = by_emp["REG_$"] + by_emp["OT_$"] + by_emp["DT_$"]
+
+    weekly = pd.DataFrame({
+        "emp_key":    by_emp["emp_key"],
+        "employee":   by_emp["employee"],
+        "ssn":        by_emp["emp_key"].map(lambda k: ssn_map.get(k, "") if ssn_map else ""),
+        "Status":     "A",
+        "Type":       by_emp["WTYPE"].map(lambda s: "S" if str(s).upper().startswith("S") else "H"),
+        "rate":       by_emp["rate"].map(_money),
+        "department": by_emp["DEPARTMENT"].astype(str),
+        "REG":        by_emp["REG"].map(_money),
+        "OT":         by_emp["OT"].map(_money),
+        "DT":         by_emp["DT"].map(_money),
+        "REG_$":      by_emp["REG_$"].map(_money),
+        "OT_$":       by_emp["OT_$"].map(_money),
+        "DT_$":       by_emp["DT_$"].map(_money),
+        "TOTAL_$":    by_emp["TOTAL_$"].map(_money),
+    })
+
+    weekly["ssn"] = weekly["ssn"].fillna("").astype(str)
+    weekly = weekly.drop(columns=["emp_key"])
+    return weekly
+
+# ---------- WBS template write (WEEKLY only) ----------
+def _find_wbs_header(ws: Worksheet) -> Tuple[int, Dict[str, int]]:
+    req_aliases = {
+        "ssn": ["ssn"],
+        "name": ["employee name","employee","name"],
+        "status":["status"],
+        "type": ["type"],
+        "rate": ["pay rate","payrate","rate"],
+        "dept": ["dept","department"],
+        "a01": ["a01","regular","reg"],
+        "a02": ["a02","overtime","ot"],
+        "a03": ["a03","doubletime","dt"],
     }
+    opt_aliases = {
+        "reg_amt":     ["a01 $","a01$","reg $","regular $","regular amt","a01 amount"],
+        "ot_amt":      ["a02 $","a02$","ot $","overtime $","overtime amt","a02 amount"],
+        "dt_amt":      ["a03 $","a03$","dt $","doubletime $","doubletime amt","a03 amount"],
+        "total_amt":   ["total $","total$","grand total $"],
+        "total_plain": ["total","totals"],
+    }
+    def norm(v):
+        v = "" if v is None else str(v)
+        return re.sub(r"\s+"," ", v.replace("\n"," ").replace("\r"," ")).strip().lower()
 
-    const App = () => {
-      const [backendStatus, setBackendStatus] = useState('testing'); // testing | online | offline
-      const [currentAPI, setCurrentAPI] = useState(
-        localStorage.getItem('sierra_backend_base') || 'https://web-production-d09f2.up.railway.app'
-      );
-      const [activeTab, setActiveTab] = useState('upload'); // upload | debug
-      const [uploadedFile, setUploadedFile] = useState(null);
-      const [processing, setProcessing] = useState(false);
-      const [progress, setProgress] = useState(0);
-      const [processedFile, setProcessedFile] = useState(null);
-      const [error, setError] = useState('');
-      const [success, setSuccess] = useState('');
-      const [debugMode, setDebugMode] = useState(false);
-      const [logs, setLogs] = useState([]);
-      const log = debugLog(setLogs);
-      const fileInputRef = useRef(null);
+    best_row, best_map, best_score = None, None, -1
+    for r in range(1, ws.max_row+1):
+        row_vals = [norm(ws.cell(r,c).value) for c in range(1, ws.max_column+1)]
+        if sum(1 for v in row_vals if v) < 3: continue
+        col_map = {v:c for c,v in enumerate(row_vals, start=1) if v}
+        def pick(aliases):
+            for a in aliases:
+                if a in col_map: return col_map[a]
+                for k,c in col_map.items():
+                    if a in k: return c
+            return None
+        m = {k: pick(v) for k,v in req_aliases.items()}
+        score = sum(1 for v in m.values() if v is not None)
+        if score > best_score and m.get("name") and m.get("a01") and m.get("a02") and m.get("a03"):
+            m["reg_amt"]     = pick(opt_aliases["reg_amt"])
+            m["ot_amt"]      = pick(opt_aliases["ot_amt"])
+            m["dt_amt"]      = pick(opt_aliases["dt_amt"])
+            m["total_amt"]   = pick(opt_aliases["total_amt"])
+            m["total_plain"] = pick(opt_aliases["total_plain"])
+            best_row, best_map, best_score = r, m, score
+    if not best_row:
+        raise HTTPException(422, "WEEKLY header not found. Expect 'Employee Name' and A01/A02/A03.")
+    return best_row, best_map
 
-      // --- Save/load base URL ---
-      const saveBase = () => {
-        localStorage.setItem('sierra_backend_base', currentAPI.trim());
-        log('Saved backend URL', currentAPI, 'success');
-      };
+def write_into_wbs_template(template_bytes: bytes, weekly: pd.DataFrame) -> bytes:
+    wb = load_workbook(io.BytesIO(template_bytes))
+    ws = wb["WEEKLY"] if "WEEKLY" in wb.sheetnames else wb.active
 
-      // --- Health check + template/roster checks ---
-      const checkHealth = async () => {
-        setBackendStatus('testing'); setError(''); setSuccess('');
-        const url = currentAPI.replace(/\/+$/, '') + '/health';
-        log(`Testing health ${url} ...`);
-        try {
-          const r = await timedFetch(url, { method: 'GET' }, 10000);
-          const txt = await r.text();
-          let ok = false;
-          try { ok = r.ok && JSON.parse(txt).ok === true; } catch(_){ ok = r.ok; }
-          if (ok) {
-            setBackendStatus('online');
-            log('Health OK', txt, 'success');
-            setSuccess('Health OK');
-          } else {
-            setBackendStatus('offline');
-            log('Health not OK', { status: r.status, txt }, 'error');
-            setError(`Health not OK: ${r.status} ${r.statusText} — ${txt}`);
-          }
-        } catch (e) {
-          setBackendStatus('offline');
-          log('Health check failed', e.message, 'error');
-          setError(`Health check failed: ${e.message}`);
-        }
-      };
+    header_row, cols = _find_wbs_header(ws)
+    first_data_row = header_row + 1
 
-      const checkTemplate = async () => {
-        setError(''); setSuccess('');
-        const url = currentAPI.replace(/\/+$/, '') + '/template-status';
-        log(`GET ${url}`);
-        try {
-          const r = await timedFetch(url, { method: 'GET' }, 15000);
-          const txt = await r.text();
-          log('Template response', txt, r.ok ? 'success' : 'error');
-          if (r.ok && /"found"/i.test(txt)) setSuccess('Template: found');
-          else setError(`Template issue: ${txt || r.statusText}`);
-        } catch (e) {
-          setError(`Template check failed: ${e.message}`);
-          log('Template check failed', e.message, 'error');
-        }
-      };
+    scan_col = cols.get("name") or cols.get("ssn") or 2
+    last = ws.max_row
+    last_data = first_data_row - 1
+    for r in range(first_data_row, last+1):
+        if ws.cell(r, scan_col).value not in (None, ""):
+            last_data = r
+    if last_data >= first_data_row:
+        ws.delete_rows(first_data_row, last_data - first_data_row + 1)
 
-      const checkRoster = async () => {
-        setError(''); setSuccess('');
-        const url = currentAPI.replace(/\/+$/, '') + '/roster-status';
-        log(`GET ${url}`);
-        try {
-          const r = await timedFetch(url, { method: 'GET' }, 15000);
-          const txt = await r.text();
-          log('Roster response', txt, r.ok ? 'success' : 'error');
-          if (r.ok && /"found"/i.test(txt)) setSuccess('Roster: found');
-          else setError('Roster: missing');
-        } catch (e) {
-          setError(`Roster check failed: ${e.message}`);
-          log('Roster check failed', e.message, 'error');
-        }
-      };
+    for _, row in weekly.iterrows():
+        values = [""] * max(ws.max_column, 64)
+        if cols.get("ssn"):      values[cols["ssn"] - 1]    = row.get("ssn", "")
+        if cols.get("name"):     values[cols["name"] - 1]   = row.get("employee", "")
+        if cols.get("status"):   values[cols["status"] - 1] = row.get("Status", "A")
+        if cols.get("type"):     values[cols["type"] - 1]   = row.get("Type", "H")
+        if cols.get("rate"):     values[cols["rate"] - 1]   = row.get("rate", 0.0)
+        if cols.get("dept"):     values[cols["dept"] - 1]   = row.get("department", "")
+        if cols.get("a01"):      values[cols["a01"] - 1]    = row.get("REG", 0.0)
+        if cols.get("a02"):      values[cols["a02"] - 1]    = row.get("OT", 0.0)
+        if cols.get("a03"):      values[cols["a03"] - 1]    = row.get("DT", 0.0)
+        if cols.get("reg_amt"):  values[cols["reg_amt"] - 1] = row.get("REG_$", 0.0)
+        if cols.get("ot_amt"):   values[cols["ot_amt"] - 1]  = row.get("OT_$", 0.0)
+        if cols.get("dt_amt"):   values[cols["dt_amt"] - 1]  = row.get("DT_$", 0.0)
+        if cols.get("total_amt"):   values[cols["total_amt"] - 1]   = row.get("TOTAL_$", 0.0)
+        elif cols.get("total_plain"): values[cols["total_plain"] - 1] = row.get("TOTAL_$", 0.0)
+        ws.append(values)
 
-      // --- Initial auto health check ---
-      useEffect(() => { checkHealth(); /* eslint-disable-next-line */ }, []);
+    ws.append([])
+    totals = {
+        "REG":     float(weekly["REG"].sum()) if "REG" in weekly else 0.0,
+        "OT":      float(weekly["OT"].sum())  if "OT" in weekly else 0.0,
+        "DT":      float(weekly["DT"].sum())  if "DT" in weekly else 0.0,
+        "REG_$":   float(weekly["REG_$"].sum()) if "REG_$" in weekly else 0.0,
+        "OT_$":    float(weekly["OT_$"].sum())  if "OT_$" in weekly else 0.0,
+        "DT_$":    float(weekly["DT_$"].sum())  if "DT_$" in weekly else 0.0,
+        "TOTAL_$": float(weekly["TOTAL_$"].sum()) if "TOTAL_$" in weekly else 0.0,
+    }
+    row_vals = [""] * max(ws.max_column, 64)
+    if cols.get("name"):     row_vals[cols["name"] - 1]  = "TOTAL"
+    if cols.get("a01"):      row_vals[cols["a01"] - 1]   = _money(totals["REG"])
+    if cols.get("a02"):      row_vals[cols["a02"] - 1]   = _money(totals["OT"])
+    if cols.get("a03"):      row_vals[cols["a03"] - 1]   = _money(totals["DT"])
+    if cols.get("reg_amt"):  row_vals[cols["reg_amt"] - 1] = _money(totals["REG_$"])
+    if cols.get("ot_amt"):   row_vals[cols["ot_amt"] - 1]  = _money(totals["OT_$"])
+    if cols.get("dt_amt"):   row_vals[cols["dt_amt"] - 1]  = _money(totals["DT_$"])
+    if cols.get("total_amt"):   row_vals[cols["total_amt"] - 1] = _money(totals["TOTAL_$"])
+    elif cols.get("total_plain"): row_vals[cols["total_plain"] - 1] = _money(totals["TOTAL_$"])
+    ws.append(row_vals)
 
-      // --- File handling ---
-      const handleFileUpload = (file) => {
-        if (!file) return;
-        if (!/\.(xlsx|xls)$/i.test(file.name)) {
-          const msg = 'Please upload a valid Excel file (.xlsx or .xls)';
-          setError(msg); setSuccess('');
-          log('File validation failed', msg, 'error');
-          return;
-        }
-        setUploadedFile(file);
-        setProcessedFile(null);
-        setError('');
-        setSuccess('File uploaded — ready to process.');
-        log('File selected', { name: file.name, size: file.size }, 'success');
-      };
+    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
+    return bio.read()
 
-      // --- Convert Sierra -> WBS ---
-      const processPayroll = async () => {
-        if (!uploadedFile) { setError('Please upload a file first'); return; }
-        if (backendStatus !== 'online') { setError('Backend offline — fix health first'); return; }
+# ---------- routes ----------
+@app.get("/health")
+def health():
+    return {"ok": True, "ts": datetime.utcnow().isoformat() + "Z"}
 
-        setProcessing(true); setProgress(0); setError(''); setSuccess('');
-        log('Starting payroll processing', { api: currentAPI, file: uploadedFile.name });
+@app.get("/template-status")
+def template_status():
+    try:
+        _ = _load_template_bytes()
+        return {"template": "found"}
+    except HTTPException as e:
+        return JSONResponse({"template": "missing", "detail": str(e.detail)}, status_code=422)
 
-        // Fake progress to show life in UI
-        const tick = setInterval(() => setProgress(p => (p >= 90 ? 90 : p + 10)), 200);
+@app.get("/roster-status")
+def roster_status():
+    r = _load_roster_df()
+    if r is None:
+        return {"roster": "missing"}
+    return {"roster": "found", "employees": int(r.drop_duplicates('employee_key').shape[0])}
 
-        try {
-          const fd = new FormData(); fd.append('file', uploadedFile);
-          const url = currentAPI.replace(/\/+$/, '') + '/process-payroll';
-          log(`POST ${url} (multipart/form-data)`);
+@app.post("/process-payroll")
+async def process_payroll(file: UploadFile = File(..., description="Sierra payroll .xlsx")):
+    if not file or not file.filename:
+        raise HTTPException(400, "No Sierra file provided.")
+    if not _ext_ok(file.filename):
+        raise HTTPException(415, "Unsupported Sierra file type. Use .xlsx or .xls")
+    try:
+        sierra_bytes = await file.read()
+        weekly = build_weekly_from_sierra(sierra_bytes)
+    except HTTPException as he:
+        raise HTTPException(he.status_code, str(he.detail))
+    except ValueError as ve:
+        raise HTTPException(422, str(ve))
+    except Exception as e:
+        raise HTTPException(500, f"Sierra parse error: {e}")
 
-          const r = await timedFetch(url, { method: 'POST', body: fd }, 120000);
+    try:
+        tmpl = _load_template_bytes()
+        out_bytes = write_into_wbs_template(tmpl, weekly)
+    except HTTPException as he:
+        raise HTTPException(he.status_code, str(he.detail))
+    except Exception as e:
+        raise HTTPException(500, f"Template processing error: {e}")
 
-          if (!r.ok) {
-            const text = await r.text().catch(()=>'');
-            log('Server error on process', { status: r.status, text }, 'error');
-            throw new Error(`Server ${r.status}: ${text || r.statusText || 'Unknown error'}`);
-          }
-
-          const blob = await r.blob();
-          const outName = `WBS_Payroll_${new Date().toISOString().split('T')[0]}.xlsx`;
-          const link = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = link; a.download = outName; document.body.appendChild(a); a.click(); a.remove();
-          URL.revokeObjectURL(link);
-
-          setProgress(100);
-          setProcessedFile({ blob, filename: outName });
-          setSuccess('Payroll processed — file downloaded.');
-          log('Payroll processed OK', { filename: outName, size: blob.size }, 'success');
-
-        } catch (e) {
-          if (e.name === 'AbortError') {
-            setError('Timed out after 120s — backend may be cold or busy.');
-            log('Timeout converting', null, 'error');
-          } else {
-            setError(`Error processing payroll: ${e.message}`);
-            log('Convert failed', e.message, 'error');
-          }
-        } finally {
-          clearInterval(tick);
-          setProcessing(false);
-        }
-      };
-
-      // --- Download again button ---
-      const downloadProcessedFile = () => {
-        if (!processedFile) return;
-        const url = URL.createObjectURL(processedFile.blob);
-        const a = document.createElement('a');
-        a.href = url; a.download = processedFile.filename;
-        document.body.appendChild(a); a.click(); a.remove();
-        URL.revokeObjectURL(url);
-        log('File re-downloaded', processedFile.filename, 'success');
-      };
-
-      // --- UI ---
-      return React.createElement(
-        React.Fragment,
-        null,
-        React.createElement("button", {
-          onClick: () => setDebugMode(!debugMode),
-          className: "debug-toggle bg-gray-800 text-white p-2 rounded-lg shadow-lg",
-          title: "Toggle Debug Mode"
-        }, React.createElement("i", { className: "fas fa-bug" })),
-
-        React.createElement("header", { className: "sierra-blue text-white shadow-lg" },
-          React.createElement("div", { className: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6" },
-            React.createElement("div", { className: "flex items-center justify-between" },
-              React.createElement("div", { className: "flex items-center space-x-4" },
-                React.createElement("div", { className: "bg-white bg-opacity-20 p-3 rounded-lg" },
-                  React.createElement("i", { className: "fas fa-hard-hat text-2xl sierra-accent" })
-                ),
-                React.createElement("div", null,
-                  React.createElement("h1", { className: "sierra-logo text-3xl font-bold" }, "SIERRA ROOFING"),
-                  React.createElement("p", { className: "text-blue-200" }, "Payroll Automation System - Debug Mode")
-                )
-              ),
-              React.createElement("div", { className: "hidden md:flex items-center space-x-4" },
-                React.createElement("div", { className: "text-right" },
-                  React.createElement("p", { className: "text-sm text-blue-200" }, "Backend Status"),
-                  React.createElement("p", {
-                    className: `font-semibold ${
-                      backendStatus === 'online' ? 'status-online' :
-                      backendStatus === 'testing' ? 'status-testing' : 'status-offline'}`
-                  },
-                  React.createElement("i", {
-                    className: `fas ${
-                      backendStatus === 'online' ? 'fa-circle' :
-                      backendStatus === 'testing' ? 'fa-spinner fa-spin' : 'fa-times-circle'
-                    } text-xs mr-1`
-                  }),
-                  backendStatus === 'online' ? 'Online' : backendStatus === 'testing' ? 'Testing...' : 'Offline'),
-                  backendStatus === 'offline' && React.createElement("button", {
-                    onClick: checkHealth,
-                    className: "text-xs bg-white bg-opacity-20 px-2 py-1 rounded mt-1"
-                  }, "Retry Connection")
-                )
-              )
-            )
-          )
-        ),
-
-        backendStatus === 'offline' && React.createElement("div", { className: "bg-red-600 text-white px-4 py-3" },
-          React.createElement("div", { className: "max-w-7xl mx-auto flex items-center justify-between" },
-            React.createElement("div", { className: "flex items-center" },
-              React.createElement("i", { className: "fas fa-exclamation-triangle mr-2" }),
-              React.createElement("span", null, "Backend connection failed. Check CORS or update the backend URL.")
-            ),
-            React.createElement("button", {
-              onClick: () => setDebugMode(true),
-              className: "bg-white bg-opacity-20 px-3 py-1 rounded text-sm"
-            }, "View Debug Info")
-          )
-        ),
-
-        React.createElement("nav", { className: "bg-white shadow-sm border-b" },
-          React.createElement("div", { className: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8" },
-            React.createElement("div", { className: "flex space-x-8" },
-              ['upload','debug'].map(id =>
-                React.createElement("button", {
-                  key: id,
-                  onClick: () => setActiveTab(id),
-                  className: `py-4 px-2 border-b-2 font-medium text-sm ${
-                    activeTab === id ? 'border-blue-500 text-blue-600'
-                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'}`
-                },
-                React.createElement("i", { className: `${id==='upload'?'fas fa-upload':'fas fa-bug'} mr-2` }),
-                id === 'upload' ? 'Process Payroll' : 'Debug Info')
-              )
-            )
-          )
-        ),
-
-        React.createElement("main", {
-          className: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8",
-          style: { paddingBottom: debugMode ? '320px' : '2rem' }
-        },
-          error && React.createElement("div", { className: "mb-6 bg-red-50 border border-red-200 rounded-md p-4" },
-            React.createElement("div", { className: "flex" },
-              React.createElement("i", { className: "fas fa-exclamation-circle text-red-400 mr-3 mt-0.5" }),
-              React.createElement("div", null,
-                React.createElement("p", { className: "text-red-700" }, error),
-                error.includes('CORS') && React.createElement("div", { className: "mt-2 text-sm text-red-600" },
-                  React.createElement("p", null, React.createElement("strong", null, "CORS Issue Troubleshooting:")),
-                  React.createElement("ul", { className: "list-disc ml-5 mt-1" },
-                    React.createElement("li", null, "Ensure backend sends CORS headers"),
-                    React.createElement("li", null, "Allow requests from this origin"),
-                    React.createElement("li", null, "Open DevTools console for exact error text")
-                  )
-                )
-              )
-            )
-          ),
-
-          success && React.createElement("div", { className: "mb-6 bg-green-50 border border-green-200 rounded-md p-4" },
-            React.createElement("div", { className: "flex" },
-              React.createElement("i", { className: "fas fa-check-circle text-green-400 mr-3 mt-0.5" }),
-              React.createElement("p", { className: "text-green-700" }, success)
-            )
-          ),
-
-          activeTab === 'upload' && React.createElement(React.Fragment, null,
-            React.createElement("div", { className: "bg-white rounded-lg shadow card-shadow p-6 mb-6" },
-              React.createElement("h2", { className: "text-xl font-semibold text-gray-900 mb-4" },
-                React.createElement("i", { className: "fas fa-server mr-2 text-blue-600" }),
-                "Backend Connection"
-              ),
-              React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-3 gap-4" },
-                React.createElement("div", { className: "md:col-span-2" },
-                  React.createElement("label", { className: "block text-sm text-gray-600 mb-1" }, "Backend URL"),
-                  React.createElement("input", {
-                    value: currentAPI, onChange: e => setCurrentAPI(e.target.value),
-                    className: "w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500",
-                    placeholder: "https://your-app.up.railway.app"
-                  })
-                ),
-                React.createElement("div", { className: "flex items-end" },
-                  React.createElement("button", { onClick: saveBase, className: "bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-medium" },
-                    React.createElement("i", { className: "fas fa-save mr-2" }), "Save"
-                  )
-                )
-              ),
-              React.createElement("div", { className: "mt-4 flex items-center gap-2" },
-                React.createElement("button", { onClick: checkHealth, className: "bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded" },
-                  React.createElement("i", { className: "fas fa-heartbeat mr-2" }), "Health"
-                ),
-                React.createElement("button", { onClick: checkTemplate, className: "bg-gray-700 hover:bg-gray-800 text-white px-3 py-2 rounded" },
-                  React.createElement("i", { className: "fas fa-file-excel mr-2" }), "Template"
-                ),
-                React.createElement("button", { onClick: checkRoster, className: "bg-gray-700 hover:bg-gray-800 text-white px-3 py-2 rounded" },
-                  React.createElement("i", { className: "fas fa-users mr-2" }), "Roster"
-                ),
-                React.createElement("span", {
-                  className: `${
-                    backendStatus === 'online' ? 'text-green-600' :
-                    backendStatus === 'testing' ? 'text-yellow-600' : 'text-red-600'
-                  } ml-2`
-                }, `Status: ${backendStatus}`)
-              )
-            ),
-
-            React.createElement("div", { className: "bg-white rounded-lg shadow card-shadow p-6 mb-6" },
-              React.createElement("h2", { className: "text-xl font-semibold text-gray-900 mb-4" },
-                React.createElement("i", { className: "fas fa-upload mr-2 text-blue-600" }),
-                "Upload Sierra Payroll File"
-              ),
-              React.createElement("div", {
-                className: "upload-zone rounded-lg p-8 text-center cursor-pointer",
-                onClick: () => fileInputRef.current && fileInputRef.current.click(),
-                onDragOver: e => { e.preventDefault(); e.currentTarget.classList.add('dragover'); },
-                onDragLeave: e => { e.preventDefault(); e.currentTarget.classList.remove('dragover'); },
-                onDrop: e => {
-                  e.preventDefault(); e.currentTarget.classList.remove('dragover');
-                  const files = Array.from(e.dataTransfer.files);
-                  if (files.length) handleFileUpload(files[0]);
-                }
-              },
-                React.createElement("input", {
-                  ref: fileInputRef, type: "file", accept: ".xlsx,.xls", className: "hidden",
-                  onChange: e => handleFileUpload(e.target.files[0])
-                }),
-                uploadedFile
-                  ? React.createElement("div", null,
-                      React.createElement("i", { className: "fas fa-file-excel text-4xl text-green-500 mb-3" }),
-                      React.createElement("p", { className: "text-lg font-medium text-gray-900 mb-2" }, uploadedFile.name),
-                      React.createElement("p", { className: "text-sm text-gray-500" }, `Size: ${(uploadedFile.size/1024/1024).toFixed(2)} MB`),
-                      React.createElement("button", {
-                        onClick: e => { e.stopPropagation(); setUploadedFile(null); setProcessedFile(null); setSuccess(''); },
-                        className: "mt-3 text-red-600 hover:text-red-800"
-                      }, React.createElement("i", { className: "fas fa-times mr-1" }), "Remove File")
-                    )
-                  : React.createElement("div", null,
-                      React.createElement("i", { className: "fas fa-cloud-upload-alt text-4xl text-gray-400 mb-3" }),
-                      React.createElement("p", { className: "text-lg font-medium text-gray-900 mb-2" }, "Drop your Excel file here, or click to browse"),
-                      React.createElement("p", { className: "text-sm text-gray-500" }, "Supports .xlsx and .xls files up to 10MB")
-                    )
-              )
-            ),
-
-            React.createElement("div", { className: "bg-white rounded-lg shadow card-shadow p-6" },
-              React.createElement("h2", { className: "text-xl font-semibold text-gray-900 mb-4" },
-                React.createElement("i", { className: "fas fa-cog mr-2 text-blue-600" }),
-                "Process Payroll Data"
-              ),
-              processing && React.createElement("div", { className: "mb-4" },
-                React.createElement("div", { className: "flex justify-between text-sm text-gray-600 mb-1" },
-                  React.createElement("span", null, "Processing payroll data..."),
-                  React.createElement("span", null, `${progress}%`)
-                ),
-                React.createElement("div", { className: "w-full bg-gray-200 rounded-full h-2" },
-                  React.createElement("div", {
-                    className: "progress-bar bg-blue-600 h-2 rounded-full",
-                    style: { width: `${progress}%` }
-                  })
-                )
-              ),
-              React.createElement("div", { className: "flex items-center gap-3" },
-                React.createElement("button", {
-                  onClick: processPayroll,
-                  disabled: !uploadedFile || processing || backendStatus !== 'online',
-                  className: "btn-primary text-white px-6 py-3 rounded-lg font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-                },
-                  processing
-                    ? React.createElement(React.Fragment, null,
-                        React.createElement("i", { className: "fas fa-spinner fa-spin mr-2" }), "Processing..."
-                      )
-                    : (backendStatus !== 'online'
-                        ? React.createElement(React.Fragment, null,
-                            React.createElement("i", { className: "fas fa-exclamation-triangle mr-2" }), "Backend Offline"
-                          )
-                        : React.createElement(React.Fragment, null,
-                            React.createElement("i", { className: "fas fa-play mr-2" }), "Process Payroll"
-                          )
-                      )
-                ),
-                processedFile && React.createElement("button", {
-                  onClick: downloadProcessedFile,
-                  className: "bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg font-medium"
-                }, React.createElement("i", { className: "fas fa-download mr-2" }), "Download Again")
-              )
-            )
-          ),
-
-          activeTab === 'debug' && React.createElement(React.Fragment, null,
-            React.createElement("div", { className: "bg-white rounded-lg shadow card-shadow p-6 mb-6" },
-              React.createElement("h2", { className: "text-xl font-semibold text-gray-900 mb-4" },
-                React.createElement("i", { className: "fas fa-bug mr-2 text-blue-600" }), "Debug Information"
-              ),
-              React.createElement("div", { className: "grid grid-cols-1 md:grid-cols-2 gap-6" },
-                React.createElement("div", null,
-                  React.createElement("h3", { className: "font-medium text-gray-900 mb-2" }, "System Status"),
-                  React.createElement("div", { className: "space-y-2 text-sm" },
-                    React.createElement("div", { className: "flex justify-between" },
-                      React.createElement("span", null, "Frontend Domain:"),
-                      React.createElement("span", { className: "font-mono" }, window.location.origin)
-                    ),
-                    React.createElement("div", { className: "flex justify-between" },
-                      React.createElement("span", null, "Current API:"),
-                      React.createElement("span", { className: "font-mono break-all" }, currentAPI)
-                    ),
-                    React.createElement("div", { className: "flex justify-between" },
-                      React.createElement("span", null, "Backend Status:"),
-                      React.createElement("span", { className: backendStatus==='online'?'text-green-600':backendStatus==='testing'?'text-yellow-600':'text-red-600' }, backendStatus)
-                    )
-                  )
-                ),
-                React.createElement("div", null,
-                  React.createElement("h3", { className: "font-medium text-gray-900 mb-2" }, "Quick Actions"),
-                  React.createElement("div", { className: "space-x-2" },
-                    React.createElement("button", { onClick: checkHealth, className: "bg-blue-600 text-white px-3 py-1 rounded text-sm" }, "Health"),
-                    React.createElement("button", { onClick: checkTemplate, className: "bg-gray-700 text-white px-3 py-1 rounded text-sm" }, "Template"),
-                    React.createElement("button", { onClick: checkRoster, className: "bg-gray-700 text-white px-3 py-1 rounded text-sm" }, "Roster"),
-                    React.createElement("button", { onClick: () => setLogs([]), className: "bg-red-600 text-white px-3 py-1 rounded text-sm" }, "Clear Logs")
-                  )
-                )
-              )
-            ),
-            React.createElement("div", { className: "bg-white rounded-lg shadow card-shadow p-6" },
-              React.createElement("h3", { className: "font-medium text-gray-900 mb-4" }, "Recent Debug Logs"),
-              React.createElement("div", { className: "debug-console p-4 rounded" },
-                logs.length
-                  ? logs.slice(-150).map((logItem, i) =>
-                      React.createElement("div", { key: i, className:
-                        logItem.type==='error'?'text-red-400':
-                        logItem.type==='success'?'text-green-400':
-                        logItem.type==='request'?'text-yellow-400':'text-gray-300'
-                      },
-                        React.createElement("span", { className: "text-gray-500" }, `[${logItem.timestamp}] `),
-                        logItem.message,
-                        logItem.data ? React.createElement("pre", { className: "text-xs mt-1 text-gray-400" },
-                          typeof logItem.data === 'string' ? logItem.data : JSON.stringify(logItem.data, null, 2)
-                        ) : null
-                      )
-                    )
-                  : React.createElement("div", { className: "text-gray-500" }, "No debug logs yet...")
-              )
-            )
-          )
-        ),
-
-        React.createElement("footer", { className: "bg-gray-800 text-white mt-12" },
-          React.createElement("div", { className: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8" },
-            React.createElement("div", { className: "flex flex-col md:flex-row justify-between items-center" },
-              React.createElement("div", { className: "flex items-center space-x-4 mb-4 md:mb-0" },
-                React.createElement("div", { className: "bg-white bg-opacity-10 p-2 rounded" },
-                  React.createElement("i", { className: "fas fa-hard-hat text-lg sierra-accent" })
-                ),
-                React.createElement("div", null,
-                  React.createElement("p", { className: "font-semibold" }, "Sierra Roofing Payroll System - Debug Mode"),
-                  React.createElement("p", { className: "text-sm text-gray-400" }, "Enhanced Debugging • API Testing • CORS Detection")
-                )
-              ),
-              React.createElement("div", { className: "text-center md:text-right" },
-                React.createElement("p", { className: "text-sm text-gray-400" }, "Debug Version • Backend: Railway • Frontend: Netlify"),
-                React.createElement("p", { className: "text-xs text-gray-500 mt-1" }, "Timeout guard • Clear error text • Download-safe blob()")
-              )
-            )
-          )
-        ),
-
-        debugMode && React.createElement("div", { className: "fixed bottom-0 left-0 right-0 z-50 bg-gray-900 border-t border-gray-700" },
-          React.createElement("div", { className: "p-4" },
-            React.createElement("div", { className: "flex justify-between items-center mb-2" },
-              React.createElement("h3", { className: "text-white font-semibold" }, "Debug Console"),
-              React.createElement("div", { className: "space-x-2" },
-                React.createElement("button", { onClick: () => setLogs([]), className: "text-xs bg-gray-700 text-white px-2 py-1 rounded" }, "Clear"),
-                React.createElement("button", { onClick: checkHealth, className: "text-xs bg-blue-600 text-white px-2 py-1 rounded" }, "Health")
-              )
-            ),
-            React.createElement("div", { className: "debug-console p-2 rounded" },
-              logs.length
-                ? logs.slice(-80).map((logItem,i) =>
-                    React.createElement("div", { key: i, className:
-                      logItem.type==='error'?'text-red-400':
-                      logItem.type==='success'?'text-green-400':
-                      logItem.type==='request'?'text-yellow-400':'text-gray-300'
-                    },
-                      React.createElement("span", { className: "text-gray-500" }, `[${logItem.timestamp}] `),
-                      logItem.message,
-                      logItem.data ? React.createElement("pre", { className: "text-xs mt-1 text-gray-400" },
-                        typeof logItem.data === 'string' ? logItem.data : JSON.stringify(logItem.data, null, 2)
-                      ) : null
-                    )
-                  )
-                : React.createElement("div", { className: "text-gray-500" }, "No debug logs yet...")
-            )
-          )
-        )
-      );
-    };
-
-    ReactDOM.render(React.createElement(App), document.getElementById('root'));
-  </script>
-</body>
-</html>
+    out_name = f"WBS_Payroll_{datetime.utcnow().date()}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(out_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={out_name}"}
+    )
