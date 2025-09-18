@@ -223,13 +223,18 @@ def convert_sierra_to_wbs(input_bytes: bytes, sheet_name: Optional[str] = None) 
     ws = wb.active
 
     # Clear existing data rows but keep styles
-    max_row = ws.max_row
-    if max_row >= WBS_DATA_START_ROW:
-        for r in range(WBS_DATA_START_ROW, max_row+1):
-            if all((ws.cell(row=r, column=c).value in (None, "")) for c in range(1, COL["TOTALS"]+1)):
+max_row = ws.max_row
+if max_row >= WBS_DATA_START_ROW:
+    for r in range(WBS_DATA_START_ROW, max_row + 1):
+        if all((ws.cell(row=r, column=c).value in (None, "")) for c in range(1, COL["TOTALS"] + 1)):
+            continue
+        for c in range(1, COL["TOTALS"] + 1):
+            try:
+                cell = ws.cell(row=r, column=c)
+                cell.value = None
+            except AttributeError:
+                # merged cells are read-only in openpyxl; skip them
                 continue
-            for c in range(1, COL["TOTALS"]+1):
-                ws.cell(row=r, column=c).value = None
 
     # Write rows
     current_row = WBS_DATA_START_ROW
