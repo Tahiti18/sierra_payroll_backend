@@ -6,7 +6,7 @@ from starlette.responses import Response
 
 app = FastAPI(title="Sierra → WBS Backend", version="1.0.2")
 
-# Allow your Netlify app + localhost
+# Allow Netlify + local dev
 ALLOWED_ORIGINS = [
     "https://adorable-madeleine-291bb0.netlify.app",
     "http://localhost:3000", "http://127.0.0.1:3000",
@@ -32,10 +32,6 @@ def template_status():
 def roster_status():
     return {"roster": "found", "employees": 79}
 
-# -------- your existing converter can live in convert.py ----------
-# from convert import convert_to_wbs
-# ---------------------------------------------------------------
-
 @app.post("/process-payroll")
 async def process_payroll(file: UploadFile = File(...)):
     name = (file.filename or "").lower()
@@ -45,19 +41,14 @@ async def process_payroll(file: UploadFile = File(...)):
     if not data:
         raise HTTPException(422, detail="Empty file.")
 
-    # === PLACE YOUR REAL CONVERTER HERE ===
-    # out_bytes = convert_to_wbs(data)
-    # For now, echo back the input so the pipeline completes:
+    # TODO: replace this with your real converter function
     out_bytes = data
-    # ======================================
 
     return Response(
         content=out_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            # force download with a stable filename
             "Content-Disposition": 'attachment; filename="WBS_Payroll.xlsx"',
-            # critical for iOS/Safari: prevent “stuck at 90%”
-            "Content-Length": str(len(out_bytes)),
+            "Content-Length": str(len(out_bytes)),  # <- required to stop iPad/Safari from stalling
         },
     )
