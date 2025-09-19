@@ -1,0 +1,81 @@
+Employee Name,SSN,Status,Type,Department,Pay Rate
+"Robleza, Dianne",626946016,A,H,ADMIN,28.0
+"Shafer, Emily",622809130,A,S,ADMIN,1634.62
+"Stokes, Symone",616259695,A,H,ADMIN,28.0
+"Young, Giana L",602762103,A,S,ADMIN,1538.47
+"Garcia, Bryan",616259654,A,H,GUTTR,29.0
+"Garcia, Miguel A",681068099,A,H,GUTTR,40.0
+"Hernandez, Diego",652143527,A,H,GUTTR,40.0
+"Pacheco Estrada, Jesus",645935042,A,H,GUTTR,28.0
+"Pajarito, Ramon",685942713,A,H,GUTTR,24.0
+"Rivas Beltran, Angel M",358119787,A,H,GUTTR,25.0
+"Romero Solis, Juan",836220003,A,H,GUTTR,40.0
+"Alcaraz, Luis",432946242,A,H,ROOF,32.0
+"Alvarez, Jose",534908967,A,H,ROOF,35.0
+"Arizmendi, Fernando",613871092,A,H,ROOF,40.0
+"Arroyo, Jose",364725751,A,H,ROOF,27.0
+"Bello, Luis",616226754,A,H,ROOF,24.0
+"Bocanegra, Jose",605908531,A,H,ROOF,30.0
+"Bustos, Eric",603965173,A,H,ROOF,20.0
+"Cardoso, Hipolito",264022781,A,H,ROOF,40.0
+"Castaneda, Andy",611042001,A,H,ROOF,38.0
+"Castillo, Moises",653246578,A,H,ROOF,26.0
+"Chavez, Derick J",610591002,A,H,ROOF,27.0
+"Chavez, Endhy",625379918,A,H,ROOF,30.0
+"Contreras, Brian",137178003,A,H,ROOF,25.0
+"Cortez, Kevin",656253574,A,H,ROOF,23.0
+"Cuevas, Marcelo",625928562,A,H,ROOF,34.0
+"Cuevas Barragan, Carlos",615873427,A,H,ROOF,24.0
+"Dean, Jacob P",625154423,A,H,ROOF,29.0
+"Duarte, Esau",658836473,A,H,ROOF,24.0
+"Duarte, Kevin",654060734,A,H,ROOF,36.0
+"Espinoza, Jose Federico",607794927,A,H,ROOF,31.0
+"Esquivel, Kleber",615292328,A,H,ROOF,41.0
+"Flores, Saul Daniel L",611882540,A,H,ROOF,32.0
+"Garcia Garcia, Eduardo",621364058,A,H,ROOF,26.0
+"Gomez, Raudel",672305698,A,H,ROOF,20.0
+"Gonzalez, Alejandro",341127082,A,H,ROOF,43.0
+"Gonzalez, Emanuel",627736546,A,H,ROOF,38.0
+"Gonzalez, Miguel",623234232,A,H,ROOF,40.0
+"Hernandez, Carlos",613227314,A,H,ROOF,40.0
+"Hernandez, Edy",502304819,A,H,ROOF,32.0
+"Hernandez, Sergio",618243648,A,H,ROOF,48.0
+"Lopez, Daniel",655411126,A,H,ROOF,25.0
+"Lopez, Gerwin A",189351494,A,H,ROOF,20.0
+"Lopez, Marlon",271810139,A,H,ROOF,40.0
+"Lopez, Yair A",635455748,A,H,ROOF,27.0
+"Lopez, Zeferino",609226343,A,H,ROOF,30.0
+"Marquez, Abraham",626187104,A,H,ROOF,40.0
+"Martinez, Alberto",621101210,A,H,ROOF,43.0
+"Martinez, Emiliano B",601903561,A,H,ROOF,40.0
+"Martinez, Maciel",607333861,A,H,ROOF,26.0
+"Mateos, Daniel",660484575,A,H,ROOF,36.0
+"Moreno, Eduardo",610215629,A,H,ROOF,40.0
+"Navarro, Jose",nan,A,H,ROOF,32.0
+"Olivares, Alberto M",622936952,A,H,ROOF,25.0
+"Pelagio, Miguel Angel",086310738,A,H,ROOF,40.0
+"Perez, Edgar",797771646,A,H,ROOF,29.0
+"Ramos Grana, Omar",645024748,A,H,ROOF,28.0
+"Rodriguez, Antoni",654991245,A,H,ROOF,20.0
+"Santos, Efrain",634473263,A,H,ROOF,42.0
+"Santos, Javier",603297017,A,H,ROOF,38.0
+"Serrano, Erick V",006437019,A,H,ROOF,38.0
+"Torres, Anthony",658102450,A,H,ROOF,25.0
+"Torrez, Jose R",625855596,A,H,ROOF,29.0
+"Valle, Victor",602060741,A,H,ROOF,31.0
+"Vargas Pineda, Karina",640670356,A,H,ROOF,20.0
+"Vera, Erick",nan,A,H,ROOF,38.0
+"Vera, Victor",628795401,A,H,ROOF,40.0
+"Zamara, Cesar",625483371,A,H,ROOF,40.0
+"Anolin, Robert M",552251095,A,S,SALES,1350.0
+"Dean, Joe P",556534609,A,C,SALES,0.0
+"Garrido, Raul",657554426,A,S,SALES,2884.62
+"Magallanes, Julio",612219002,A,S,SALES,1692.32
+"Padilla, Alex",569697404,A,S,SALES,2050.0
+"Pealatere, Francis",625098739,A,C,SALES,0.0
+"Phein, Saeng Tsing",624722627,A,S,SALES,2308.0
+"Rios, Jose D",530358447,A,S,SALES,1731.0
+"Gomez, Jose",897981424,A,H,SOLAR,32.0
+"Nava, Juan M",636667958,A,H,SOLAR,30.0
+"Padilla, Carlos",614425738,A,H,SOLAR,40.0
+"Robledo, Francisco",613108074,A,H,SOLAR,40.0
