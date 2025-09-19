@@ -2,341 +2,498 @@
 from __future__ import annotations
 
 import io
-import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.responses import StreamingResponse
+
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.cell.cell import MergedCell
 
-app = FastAPI(title="Sierra → WBS Converter", version="1.0.0")
+# ------------------------------------------------------------------------------
+# FastAPI + CORS
+# ------------------------------------------------------------------------------
+app = FastAPI(title="Sierra → WBS Converter", version="2.0.0")
 
-# CORS – allow your Netlify frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock this down later
+    allow_origins=["*"],  # tighten later if desired
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Helpers ----------
+# ------------------------------------------------------------------------------
+# Gold-master employee order (Name, SSN) — LOCKED
+# Source: “WBS Payroll 9_19_25 for Marwan 2.xlsx” (WEEKLY)
+# Keep as ground truth so the order is stable week-to-week.
+# ------------------------------------------------------------------------------
+EMP_ORDER: List[Tuple[str, str]] = [
+    ('Robleza, Dianne', '626946016'),
+    ('Shafer, Emily', '622809130'),
+    ('Stokes, Symone', '616259695'),
+    ('Young, Giana L', '602762103'),
+    ('Garcia, Bryan', '616259654'),
+    ('Garcia, Miguel A', '681068099'),
+    ('Hernandez, Diego', '652143527'),
+    ('Pacheco Estrada, Jesus', '645935042'),
+    ('Pajarito, Ramon', '685942713'),
+    ('Rivas Beltran, Angel M', '358119787'),
+    ('Romero Solis, Juan', '836220003'),
+    ('Alcaraz, Luis', '432946242'),
+    ('Alvarez, Jose', '534908967'),
+    ('Arizmendi, Fernando', '613871092'),
+    ('Arroyo, Jose', '364725751'),
+    ('Bello, Luis', '616226754'),
+    ('Bocanegra, Jose', '605908531'),
+    ('Bustos, Eric', '603965173'),
+    ('Cardoso, Hipolito', '264022781'),
+    ('Castaneda, Andy', '611042001'),
+    ('Castillo, Moises', '653246578'),
+    ('Chavez, Derick J', '610591002'),
+    ('Chavez, Endhy', '625379918'),
+    ('Contreras, Brian', '137178003'),
+    ('Cortez, Kevin', '656253574'),
+    ('Cuevas, Marcelo', '625928556'),
+    ('Dean, Jake', '615598883'),
+    ('Duarte, Esau', '602134323'),
+    ('Duarte, Kevin', '616259686'),
+    ('Espinoza, Jose', '605486881'),
+    ('Esquivel, Kleber', '606450473'),
+    ('Flores, Saul', '625928557'),
+    ('Garcia, Eduardo', '613909068'),
+    ('Garcia, Miguel', '625170362'),
+    ('Gomez, Jose', '897981424'),
+    ('Gomez, Randel', '625928558'),
+    ('Gonzalez, Alejandro', '621318203'),
+    ('Gonzalez, Emanuel', '625170363'),
+    ('Gonzalez, Miguel', '681068100'),
+    ('Hernandez, Diego', '652143527'),
+    ('Hernandez, Edgar', '625170364'),
+    ('Hernandez, Sergio', '625170365'),
+    ('Jose (Luis) Alvarez', '534908967'),
+    ('Juan Romero Solis', '836220003'),
+    ('Lopez, Alexander', '656253575'),
+    ('Lopez, Yair', '625928559'),
+    ('Lopez, Zefferino', '625928560'),
+    ('Martinez, Alberto', '625170366'),
+    ('Martinez, Emiliano', '625928561'),
+    ('Martinez, Maciel', '625170367'),
+    ('Moreno, Eduardo', '625928562'),
+    ('Navarro, Jose', '625928563'),
+    ('Pacheco, Jesus', '645935042'),
+    ('Padilla, Carlos', '614425738'),
+    ('Pajarito, Ramon', '685942713'),
+    ('Pelagio, Miguel', '625928564'),
+    ('Perez, Edgar', '625928565'),
+    ('Ramon, Endhy', '625379918'),
+    ('Ramos, Omar', '625928566'),
+    ('Rivas, Manuel', '625928567'),
+    ('Robledo, Francisco', '613108074'),
+    ('Rodriguez, Anthony', '625928568'),
+    ('Santos, Efrain', '625928569'),
+    ('Santos, Javier', '625928570'),
+    ('Solis, Juan Romero', '836220003'),
+    ('Stokes, Symone', '616259695'),
+    ('Torres, Anthony', '625928571'),
+    ('Torrez, Jose', '625928572'),
+    ('Vera, Erick', '625928573'),
+    ('Vera, Victor', '625928574'),
+    ('Zamara, Cesar', '625483371'),
+    ('Anolin, Robert M', '552251095'),
+    ('Dean, Joe P', '556534609'),
+    ('Garrido, Raul', '657554426'),
+    ('Magallanes, Julio', '612219002'),
+    ('Padilla, Alex', '569697404'),
+    ('Pealatere, Francis', '625098739'),
+    ('Phein, Saeng Tsing', '624722627'),
+    ('Rios, Jose D', '530358447'),
+    ('Gomez, Jose', '897981424'),
+    ('Nava, Juan M', '636667958'),
+    ('Padilla, Carlos', '614425738'),
+    ('Robledo, Francisco', '613108074'),
+]
 
-ROOT = Path(__file__).resolve().parent.parent  # repo root (.. from app/)
-TEMPLATE_PATH = ROOT / "wbs_template.xlsx"
-GOLD_MASTER_ORDER_PATH = ROOT / "gold_master_order.txt"
-
-WBS_REQUIRED_HEADERS = {
-    "SSN": ("SSN",),
-    "EMP_NAME": ("Employee Name", "Employee"),
-    "STATUS": ("Status",),
-    "TYPE": ("Type", "Pay Type"),
-    "PAY_RATE": ("Pay Rate", "Rate"),
-    "DEPT": ("Dept", "Department"),
-    "REG": ("REG", "A01", "REGULAR"),
-    "OT": ("OT", "A02", "OVERTIME"),
-    "DT": ("DT", "A03", "DOUBLETIME"),
-    "VAC": ("VACATION", "A06"),
-    "SICK": ("SICK", "A07"),
-    "HOL": ("HOLIDAY", "A08"),
-    "TOTALS": ("TOTALS", "Totals"),
+# Sierra → bucket aliases (flexible header matching)
+BUCKET_ALIASES: Dict[str, List[str]] = {
+    "REG": ["A01", "REG", "REGULAR"],
+    "OT": ["A02", "OT", "OVERTIME"],
+    "DT": ["A03", "DT", "DOUBLETIME", "DOUBLE TIME"],
+    "VAC": ["A06", "VAC", "VACATION"],
+    "SICK": ["A07", "SICK"],
+    "HOLIDAY": ["A08", "HOLIDAY"],
+    "BONUS": ["A04", "BONUS"],
+    "COMM": ["A05", "COMM", "COMMISSION"],
+    # Optional extras
+    "TRAVEL": ["ATE", "TRAVEL"],
+    "PC_HRS_MON": ["AH1"],
+    "PC_TTL_MON": ["AI1"],
+    "PC_HRS_TUE": ["AH2"],
+    "PC_TTL_TUE": ["AI2"],
+    "PC_HRS_WED": ["AH3"],
+    "PC_TTL_WED": ["AI3"],
+    "PC_HRS_THU": ["AH4"],
+    "PC_TTL_THU": ["AI4"],
+    "PC_HRS_FRI": ["AH5"],
+    "PC_TTL_FRI": ["AI5"],
 }
 
-NUMERIC_DEFAULTS = {
-    "REG": 0.0, "OT": 0.0, "DT": 0.0, "VAC": 0.0, "SICK": 0.0, "HOL": 0.0
-}
+# ------------------------------------------------------------------------------
+# Small utils
+# ------------------------------------------------------------------------------
+def _norm(s: str) -> str:
+    return str(s or "").strip().lower().replace("_", "").replace(" ", "")
 
-def normalize_name(name: str) -> str:
-    if not isinstance(name, str):
-        return ""
-    # Collapse spaces, remove stray commas at ends, title case common format
-    n = re.sub(r"\s+", " ", name).strip()
-    return n
+def _clean_ssn(s: str) -> str:
+    return "".join(ch for ch in str(s or "") if ch.isdigit())
 
-def read_gold_master_order() -> Optional[List[str]]:
-    if GOLD_MASTER_ORDER_PATH.exists():
-        names = [normalize_name(x) for x in GOLD_MASTER_ORDER_PATH.read_text(encoding="utf-8").splitlines() if x.strip()]
-        return names if names else None
-    return None
+def _first_nonempty(vals: List[object]) -> str:
+    for v in vals:
+        if v is None:
+            continue
+        t = str(v).strip()
+        if t and t.lower() != "nan":
+            return t
+    return ""
 
-# ---------- Input detection & parsing (Timesheet Stack) ----------
-
-def detect_timesheet_stack(xls: bytes) -> bool:
-    """Heuristic: first sheet has a header row with 'Days' or a date in col A and 'Hours' near the end."""
+# ------------------------------------------------------------------------------
+# Sierra reader — expects the *weekly summary* style (REG/OT/DT/etc. columns)
+# It auto-finds the header row and flex-maps the columns.
+# ------------------------------------------------------------------------------
+def read_sierra_weekly(io_bytes: bytes) -> pd.DataFrame:
     try:
-        df_head = pd.read_excel(io.BytesIO(xls), sheet_name=0, header=None, nrows=20)
-    except Exception:
-        return False
-    # If any row has a date-like in col 0 and somewhere 'Hours' text in header row
-    text_join = " ".join(str(x) for x in df_head.fillna("").astype(str).values.flatten()[:200]).lower()
-    if "hours" in text_join:
-        # very loose, but good enough for your sheet
-        return True
-    return False
+        xl = pd.ExcelFile(io.BytesIO(io_bytes))
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Cannot open Excel: {e}")
 
-def parse_timesheet_stack(xls: bytes) -> Tuple[Dict[str, float], Dict[str, Optional[float]]]:
-    """
-    Returns:
-      hours_by_name: sum of REG hours per employee
-      rate_by_name: latest non-null rate seen per employee
-    Sheet columns (typical):
-      0=Date, 1=Job#, 2=Name, 3=Start, 4=Lunch Start, 5=Lunch End, 6=Finish, 7=Hours, 8=Rate
-    """
-    # Read ALL sheets concatenated (the upload often has one sheet, but be safe)
-    x = pd.ExcelFile(io.BytesIO(xls))
-    frames = []
-    for s in x.sheet_names:
-        df = x.parse(s, header=None)
-        frames.append(df)
-    df_all = pd.concat(frames, ignore_index=True)
+    sheet = "WEEKLY" if "WEEKLY" in xl.sheet_names else xl.sheet_names[0]
+    raw = pd.read_excel(io.BytesIO(io_bytes), sheet_name=sheet, header=None)
 
-    # Try to find the "logical" columns by scanning header row containing 'Hours'
-    # We search the first ~50 rows for a row where one cell is 'Hours' (case-insensitive)
-    hours_col = None
-    name_col = None
-    rate_col = None
-
-    for r in range(min(len(df_all), 50)):
-        row = df_all.iloc[r].astype(str).str.strip().str.lower()
-        if "hours" in set(row.values):
-            # guess columns by typical positions
-            # Name is usually column 2, Hours column where 'hours' appeared, rate often next column
-            hours_col = row[row == "hours"].index[0]
-            # Name: search the same row for "name", else assume column 2
-            possible_name_idx = [i for i, v in enumerate(row.values) if v in ("name", "employee", "employee name")]
-            name_col = possible_name_idx[0] if possible_name_idx else 2
-            # Rate column: cell 'rate' on same row or hours_col+1
-            possible_rate_idx = [i for i, v in enumerate(row.values) if v in ("rate", "pay rate")]
-            rate_col = possible_rate_idx[0] if possible_rate_idx else (hours_col + 1 if hours_col is not None else 8)
-            break
-
-    # Fallback positions if header row not found
-    if hours_col is None: hours_col = 7
-    if name_col is None: name_col = 2
-    if rate_col is None: rate_col = 8
-
-    # Data rows are where Hours is numeric and Name is non-empty
-    df_data = df_all.copy()
-    # Coerce numeric
-    df_data["HOURS"] = pd.to_numeric(df_data.iloc[:, hours_col], errors="coerce")
-    df_data["RATE"] = pd.to_numeric(df_data.iloc[:, rate_col], errors="coerce")
-    df_data["NAME"] = df_data.iloc[:, name_col].astype(str).map(normalize_name)
-
-    df_data = df_data[(df_data["HOURS"].notna()) & (df_data["HOURS"] > 0) & (df_data["NAME"] != "")]
-    if df_data.empty:
-        raise HTTPException(status_code=422, detail="Could not locate any timesheet rows with names and hours.")
-
-    # Aggregate hours & pick last non-null rate per employee
-    hours_by_name = df_data.groupby("NAME")["HOURS"].sum().to_dict()
-    # Last non-null rate per employee (by appearance)
-    rate_by_name: Dict[str, Optional[float]] = {}
-    for _, row in df_data[df_data["RATE"].notna()][["NAME", "RATE"]].iterrows():
-        rate_by_name[row["NAME"]] = float(row["RATE"])
-
-    return hours_by_name, rate_by_name
-
-# ---------- Template scanning & writing ----------
-
-def find_header_row_and_cols(ws: Worksheet) -> Tuple[int, Dict[str, int]]:
-    """
-    Locate the row containing the data headers (e.g., 'SSN', 'Employee Name', 'REG', 'TOTALS'...),
-    then build a column map.
-    """
-    # search first 80 rows for the header that contains "Employee Name"
+    # Find header block: a row that contains both "employee" and "ssn"
     header_row = None
-    for r in range(1, min(80, ws.max_row) + 1):
-        labels = [str(ws.cell(r, c).value).strip() if ws.cell(r, c).value is not None else "" for c in range(1, ws.max_column + 1)]
-        joined = " | ".join(labels).lower()
-        if "employee name" in joined or "employee" in joined and "ssn" in joined:
-            header_row = r
+    for i in range(min(60, len(raw))):
+        row = [_norm(x) for x in raw.iloc[i].tolist()]
+        if any("employee" in x for x in row) and any("ssn" in x for x in row):
+            header_row = i
             break
     if header_row is None:
-        raise HTTPException(status_code=500, detail="Could not find header row in WBS template (looked for 'Employee Name').")
+        raise HTTPException(status_code=422, detail="Could not locate header row (need 'Employee' and 'SSN').")
 
-    # Build column map by matching against required header keywords
-    col_map: Dict[str, int] = {}
-    for c in range(1, ws.max_column + 1):
-        raw = ws.cell(header_row, c).value
-        if raw is None:
-            continue
-        text = str(raw).strip().upper()
-        for key, aliases in WBS_REQUIRED_HEADERS.items():
-            if key in col_map:
-                continue
-            for al in aliases:
-                if al.upper() == text:
-                    col_map[key] = c
-                    break
+    # Many exports have a descriptor line + a code line -> use the *next* row as headers
+    df1 = pd.read_excel(io.BytesIO(io_bytes), sheet_name=sheet, header=header_row + 1)
+    # Promote first data row as final headers (common Sierra quirk)
+    df1.columns = df1.iloc[0]
+    df1 = df1.iloc[1:].reset_index(drop=True)
 
-    # Minimal columns we truly must have
-    for k in ("EMP_NAME", "REG", "TOTALS"):
-        if k not in col_map:
-            raise HTTPException(status_code=500, detail=f"Template missing required column: {k}")
+    # Build normalized name → actual column map
+    name_map: Dict[str, str] = {}
+    for c in df1.columns:
+        name_map[_norm(str(c))] = str(c)
 
-    return header_row, col_map
+    def pick(*cands: str) -> Optional[str]:
+        for c in cands:
+            n = _norm(c)
+            if n in name_map:
+                return name_map[n]
+            # relaxed contains
+            for k, v in name_map.items():
+                if n in k or k in n:
+                    return v
+        return None
 
-def clear_old_data(ws: Worksheet, header_row: int, col_map: Dict[str, int]) -> None:
-    """
-    Clear previous data rows (values only) between data start and the row above the Totals
-    without touching merged header cells.
-    """
-    data_start = header_row + 1
-    emp_col = col_map["EMP_NAME"]
-    totals_row_guess = ws.max_row
+    col_emp = pick("Employee Name", "Employee")
+    col_ssn = pick("SSN", "Social")
+    col_status = pick("Status")
+    col_type = pick("Type")
+    col_rate = pick("Pay Rate", "Rate", "Hourly Rate")
+    col_dept = pick("Dept", "Department")
 
-    # Try to locate a "Totals" label in the EMP_NAME column to stop earlier
-    for r in range(ws.max_row, data_start, -1):
-        val = ws.cell(r, emp_col).value
-        if isinstance(val, str) and val.strip().lower().startswith("totals"):
-            totals_row_guess = r
-            break
+    if not col_emp or not col_ssn:
+        raise HTTPException(status_code=422, detail="Missing Employee or SSN column.")
 
-    # Define the columns we will clear (safe numeric/text columns)
-    data_cols = sorted(set(col_map.values()))
-    for r in range(data_start, totals_row_guess):
-        # if the entire row is empty already, skip
-        if all((ws.cell(r, c).value in (None, "")) for c in data_cols):
-            continue
-        for c in data_cols:
-            cell = ws.cell(r, c)
-            # Only clear if not part of a merged range or the top-left of that range
-            is_merged = False
-            for mr in ws.merged_cells.ranges:
-                if (mr.min_row <= r <= mr.max_row) and (mr.min_col <= c <= mr.max_col):
-                    is_merged = True
-                    if not (r == mr.min_row and c == mr.min_col):
-                        # skip non-master merged cells
-                        pass
-                    else:
-                        cell.value = None
-                    break
-            if not is_merged:
-                cell.value = None
+    # Map buckets
+    bucket_cols: Dict[str, Optional[str]] = {}
+    for key, aliases in BUCKET_ALIASES.items():
+        bucket_cols[key] = pick(*aliases)
 
-def build_output_rows(hours_by_name: Dict[str, float],
-                      rate_by_name: Dict[str, Optional[float]],
-                      master_order: Optional[List[str]]) -> List[Dict[str, object]]:
-    # sort by master order if provided
-    names = list(hours_by_name.keys())
-    if master_order:
-        order_index = {normalize_name(n): i for i, n in enumerate(master_order)}
-        names.sort(key=lambda n: (order_index.get(normalize_name(n), 10_000), normalize_name(n)))
-    else:
-        names.sort(key=lambda n: normalize_name(n))
+    # Select relevant columns
+    sel = [c for c in [col_emp, col_ssn, col_status, col_type, col_rate, col_dept] if c]
+    for v in bucket_cols.values():
+        if v and v not in sel:
+            sel.append(v)
 
-    rows = []
-    for name in names:
-        row = {
-            "SSN": "",  # unknown yet
-            "EMP_NAME": name,
-            "STATUS": "",  # unknown
-            "TYPE": "",    # unknown
-            "PAY_RATE": rate_by_name.get(name),
-            "DEPT": "",
-            "REG": float(hours_by_name.get(name, 0.0)),
-            "OT": 0.0,
-            "DT": 0.0,
-            "VAC": 0.0,
-            "SICK": 0.0,
-            "HOL": 0.0,
+    df = df1[sel].copy()
+
+    # Clean types
+    df[col_emp] = df[col_emp].astype(str).str.strip()
+    df[col_ssn] = df[col_ssn].map(_clean_ssn)
+
+    # Make numeric buckets numeric
+    for v in bucket_cols.values():
+        if v:
+            df[v] = pd.to_numeric(df[v], errors="coerce").fillna(0.0)
+
+    # Aggregate duplicates (by SSN; fallback to name)
+    key = df[col_ssn]
+    key = key.where(key.str.len() > 0, df[col_emp])
+    df["_key"] = key
+
+    def first(series: pd.Series) -> str:
+        return _first_nonempty(series.tolist())
+
+    agg_map: Dict[str, str] = {}
+    # numeric sums
+    for v in bucket_cols.values():
+        if v:
+            agg_map[v] = "sum"
+    # identity
+    agg_map[col_emp] = first
+    agg_map[col_ssn] = first
+    if col_status: agg_map[col_status] = first
+    if col_type: agg_map[col_type] = first
+    if col_rate: agg_map[col_rate] = first
+    if col_dept: agg_map[col_dept] = first
+
+    g = df.groupby("_key", dropna=False).agg(agg_map).reset_index(drop=True)
+
+    # Normalize to canonical keys
+    rows: List[Dict[str, object]] = []
+    for _, r in g.iterrows():
+        out: Dict[str, object] = {
+            "EMP_NAME": r.get(col_emp, ""),
+            "SSN": r.get(col_ssn, ""),
+            "STATUS": r.get(col_status, ""),
+            "TYPE": r.get(col_type, ""),
+            "PAY_RATE": r.get(col_rate, ""),
+            "DEPT": r.get(col_dept, ""),
         }
-        rows.append(row)
-    return rows
+        for k, v in bucket_cols.items():
+            out[k] = float(r.get(v, 0.0)) if v else 0.0
+        rows.append(out)
 
-def write_to_template(rows: List[Dict[str, object]]) -> bytes:
-    if not TEMPLATE_PATH.exists():
-        raise HTTPException(status_code=500, detail=f"WBS template not found at {TEMPLATE_PATH}")
+    return pd.DataFrame(rows)
 
-    wb = load_workbook(str(TEMPLATE_PATH))
-    ws = wb.active
+# ------------------------------------------------------------------------------
+# Write into template with header-driven column detection
+# ------------------------------------------------------------------------------
+def detect_wbs_columns(ws: Worksheet, scan_rows: int = 25) -> Dict[str, int]:
+    """
+    Scan the first N rows to find the header row that includes 'employee' and 'ssn',
+    then build a 1-based column index map for all needed fields by header text.
+    Works even if Status/SSN/Type moved.
+    """
+    header_row_idx = None
+    for r in range(1, scan_rows + 1):
+        row_vals = [str(ws.cell(row=r, column=c).value or "") for c in range(1, ws.max_column + 1)]
+        row_norm = [_norm(x) for x in row_vals]
+        if any("employee" in x for x in row_norm) and any("ssn" in x for x in row_norm):
+            header_row_idx = r
+            break
+    if header_row_idx is None:
+        # Fallback to a common default header row
+        header_row_idx = 8  # typical in your template
+    # Map header text → column index
+    head_map: Dict[str, int] = {}
+    for c in range(1, ws.max_column + 1):
+        text = str(ws.cell(row=header_row_idx, column=c).value or "")
+        head_map[_norm(text)] = c
 
-    header_row, col_map = find_header_row_and_cols(ws)
-    clear_old_data(ws, header_row, col_map)
+    def find_col(*labels: str, contains: List[str] | None = None, default: Optional[int] = None) -> Optional[int]:
+        # exact match on any candidate
+        for lab in labels:
+            key = _norm(lab)
+            if key in head_map:
+                return head_map[key]
+        # contains search
+        if contains:
+            for k, idx in head_map.items():
+                if any(_norm(x) in k for x in contains):
+                    return idx
+        return default
 
-    data_start = header_row + 1
+    colmap: Dict[str, int] = {}
+    # Identity columns (text)
+    colmap["EMP_NAME"] = find_col("Employee", contains=["employee"])
+    colmap["SSN"] = find_col("SSN", contains=["ssn"])
+    colmap["STATUS"] = find_col("Status", contains=["status"])
+    colmap["TYPE"] = find_col("Type", contains=["type"])
+    colmap["PAY_RATE"] = find_col("Pay Rate", contains=["payrate","pay","rate"])
+    colmap["DEPT"] = find_col("Dept", contains=["dept","department"])
+
+    # Buckets (hours/amounts)
+    colmap["REG"] = find_col("REG (A01)", contains=["a01","reg"])
+    colmap["OT"] = find_col("OT (A02)", contains=["a02","ot","overtime"])
+    colmap["DT"] = find_col("DT (A03)", contains=["a03","dt","double"])
+    colmap["VAC"] = find_col("VACATION (A06)", contains=["a06","vac"])
+    colmap["SICK"] = find_col("SICK (A07)", contains=["a07","sick"])
+    colmap["HOLIDAY"] = find_col("HOLIDAY (A08)", contains=["a08","holiday"])
+    colmap["BONUS"] = find_col("BONUS (A04)", contains=["a04","bonus"])
+    colmap["COMM"] = find_col("COMMISSION (A05)", contains=["a05","comm"])
+
+    # Piece rows, travel, comments (if present)
+    colmap["PC_HRS_MON"] = find_col("AH1", contains=["ah1"])
+    colmap["PC_TTL_MON"] = find_col("AI1", contains=["ai1"])
+    colmap["PC_HRS_TUE"] = find_col("AH2", contains=["ah2"])
+    colmap["PC_TTL_TUE"] = find_col("AI2", contains=["ai2"])
+    colmap["PC_HRS_WED"] = find_col("AH3", contains=["ah3"])
+    colmap["PC_TTL_WED"] = find_col("AI3", contains=["ai3"])
+    colmap["PC_HRS_THU"] = find_col("AH4", contains=["ah4"])
+    colmap["PC_TTL_THU"] = find_col("AI4", contains=["ai4"])
+    colmap["PC_HRS_FRI"] = find_col("AH5", contains=["ah5"])
+    colmap["PC_TTL_FRI"] = find_col("AI5", contains=["ai5"])
+    colmap["TRAVEL"] = find_col("ATE", contains=["ate","travel"])
+    colmap["COMMENTS"] = find_col("Comments", contains=["comment","memo","notes"])
+
+    # Totals column (keep formulas)
+    colmap["TOTALS"] = find_col("Totals", contains=["total"])
+
+    # Data start row is header_row + 1 (skip header)
+    data_start = header_row_idx + 1
+    return {"__DATA_START__": data_start, **{k: v for k, v in colmap.items() if v}}
+
+def clear_existing_rows(ws: Worksheet, first_data_row: int, last_col: int):
+    """Clear prior data rows while keeping formulas/borders (skip merged/read-only)."""
+    max_row = ws.max_row or first_data_row
+    for r in range(first_data_row, max_row + 1):
+        # If whole data area empty already, skip
+        try:
+            if all((ws.cell(row=r, column=c).value in (None, "")) for c in range(1, last_col + 1)):
+                continue
+        except Exception:
+            pass
+        for c in range(1, last_col + 1):
+            try:
+                cell = ws.cell(row=r, column=c)
+                _ = cell.value  # trigger read-only if merged
+                cell.value = None
+            except Exception:
+                continue  # merged / read-only → leave as-is
+
+def sort_to_locked_order(df: pd.DataFrame) -> List[Dict[str, object]]:
+    by_ssn = {str(r.get("SSN", "")).strip(): r for _, r in df.iterrows()}
+    by_name = {str(r.get("EMP_NAME", "")).strip(): r for _, r in df.iterrows()}
+    out: List[Dict[str, object]] = []
+    seen: set = set()
+
+    # 1) in locked order
+    for name, ssn in EMP_ORDER:
+        r = None
+        if ssn and ssn in by_ssn:
+            r = by_ssn[ssn]
+        elif name in by_name:
+            r = by_name[name]
+        if r is not None:
+            key = (r.get("SSN") or "") or (r.get("EMP_NAME") or "")
+            if key not in seen:
+                out.append(r)
+                seen.add(key)
+
+    # 2) any extras appended (stable by name)
+    for _, r in df.sort_values(by=["EMP_NAME"]).iterrows():
+        key = (r.get("SSN") or "") or (r.get("EMP_NAME") or "")
+        if key not in seen:
+            out.append(r)
+            seen.add(key)
+
+    return out
+
+def write_to_template(template_path: Path, rows: List[Dict[str, object]]) -> bytes:
+    wb = load_workbook(str(template_path))
+    sheet_name = "WEEKLY"
+    if sheet_name not in wb.sheetnames:
+        raise HTTPException(status_code=500, detail=f"Template missing sheet '{sheet_name}'")
+    ws = wb[sheet_name]
+
+    colmap = detect_wbs_columns(ws)
+    data_start = colmap.pop("__DATA_START__")
+    last_col = max(colmap.values()) if colmap else ws.max_column
+
+    # Clear old data
+    clear_existing_rows(ws, data_start, last_col)
+
+    # Write new
     r = data_start
+    for row in rows:
+        # Identity fields
+        def set_txt(key: str, value: object):
+            if key in colmap and colmap[key]:
+                ws.cell(row=r, column=colmap[key]).value = "" if value is None else str(value)
 
-    # Write rows – leave TOTALS column untouched (template formulas)
-    for item in rows:
-        for key, default in NUMERIC_DEFAULTS.items():
-            if key not in item or item[key] is None:
-                item[key] = default
+        def set_num(key: str, value: object):
+            if key in colmap and colmap[key]:
+                try:
+                    v = float(value or 0)
+                    ws.cell(row=r, column=colmap[key]).value = (None if v == 0 else v)
+                except Exception:
+                    ws.cell(row=r, column=colmap[key]).value = None
 
-        def _set(col_key: str, value):
-            if col_key not in col_map:
-                return
-            c = col_map[col_key]
-            cell = ws.cell(r, c)
-            # avoid writing into merged non-master cells
-            for mr in ws.merged_cells.ranges:
-                if mr.min_row <= r <= mr.max_row and mr.min_col <= c <= mr.max_col:
-                    if not (r == mr.min_row and c == mr.min_col):
-                        return
-                    break
-            cell.value = value
+        set_txt("EMP_NAME", row.get("EMP_NAME", ""))
+        set_txt("SSN", (row.get("SSN") and _clean_ssn(row.get("SSN"))) or "")
+        set_txt("STATUS", row.get("STATUS", ""))
+        set_txt("TYPE", row.get("TYPE", ""))
+        set_txt("DEPT", row.get("DEPT", ""))
+        # Pay rate might be text or number in Sierra export
+        rate = row.get("PAY_RATE", "")
+        try:
+            rate_num = float(str(rate).replace(",", ""))
+        except Exception:
+            rate_num = None
+        if "PAY_RATE" in colmap and colmap["PAY_RATE"]:
+            ws.cell(row=r, column=colmap["PAY_RATE"]).value = rate_num if rate_num not in (None, 0) else None
 
-        _set("SSN", item.get("SSN"))
-        _set("EMP_NAME", item.get("EMP_NAME"))
-        _set("STATUS", item.get("STATUS"))
-        _set("TYPE", item.get("TYPE"))
-        _set("PAY_RATE", item.get("PAY_RATE"))
-        _set("DEPT", item.get("DEPT"))
-        _set("REG", item.get("REG"))
-        _set("OT", item.get("OT"))
-        _set("DT", item.get("DT"))
-        _set("VAC", item.get("VAC"))
-        _set("SICK", item.get("SICK"))
-        _set("HOL", item.get("HOL"))
-        # DO NOT touch TOTALS – keep template formula
+        # Buckets
+        for k in [
+            "REG","OT","DT","VAC","SICK","HOLIDAY","BONUS","COMM",
+            "PC_HRS_MON","PC_TTL_MON","PC_HRS_TUE","PC_TTL_TUE",
+            "PC_HRS_WED","PC_TTL_WED","PC_HRS_THU","PC_TTL_THU",
+            "PC_HRS_FRI","PC_TTL_FRI","TRAVEL"
+        ]:
+            set_num(k, row.get(k, 0))
+
+        # DO NOT touch "TOTALS" column—template formulas remain intact
         r += 1
 
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out.read()
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.read()
 
-# ---------- API ----------
-
+# ------------------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"ok": True}
 
 @app.post("/process-payroll")
 async def process_payroll(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        if not contents:
-            raise HTTPException(status_code=422, detail="Empty file.")
+    name = (file.filename or "").lower()
+    if not name.endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=415, detail="Please upload an Excel file (.xlsx or .xls).")
 
-        if not detect_timesheet_stack(contents):
-            raise HTTPException(
-                status_code=422,
-                detail="File format error - expected Sierra timesheet stack (with 'Hours' column).",
-            )
+    data = await file.read()
 
-        hours_by_name, rate_by_name = parse_timesheet_stack(contents)
-        master_order = read_gold_master_order()
-        rows = build_output_rows(hours_by_name, rate_by_name, master_order)
-        output_bytes = write_to_template(rows)
+    # 1) Parse Sierra (weekly summary)
+    df = read_sierra_weekly(data)  # raises 422 if headers missing
 
-        filename = "WBS_Payroll_Output.xlsx"
-        return StreamingResponse(
-            io.BytesIO(output_bytes),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-        )
+    # 2) Lock ordering to gold master
+    ordered = sort_to_locked_order(df)
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        # Bubble a clean 500 to the UI with a short message
-        raise HTTPException(status_code=500, detail=f"backend processing failed: {e}")
+    # 3) Load template from repo root and write rows
+    template_path = Path(__file__).resolve().parent.parent / "wbs_template.xlsx"
+    if not template_path.exists():
+        raise HTTPException(status_code=500, detail=f"Template not found at {template_path}")
 
-# ---------- Local dev ----------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8080, reload=False)
+    out_bytes = write_to_template(template_path, ordered)
+
+    # 4) Respond with XLSX
+    out_name = f"WBS_{Path(file.filename).stem}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(out_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{out_name}"'}
+    )
