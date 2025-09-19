@@ -2,341 +2,302 @@
 from __future__ import annotations
 
 import io
-import math
+import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import Response
+from fastapi.responses import StreamingResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-app = FastAPI(title="Sierra → WBS Converter", version="1.0")
+app = FastAPI(title="Sierra → WBS Converter", version="1.0.0")
 
-# --- CORS (debug-friendly; tighten for prod if needed) ---
+# CORS – allow your Netlify frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # lock this down later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- CONFIG ----------
-# Where the template lives (repo root) and gold-master files (app/data)
-HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parent
-TEMPLATE_PATH = REPO_ROOT / "wbs_template.xlsx"
+# ---------- Helpers ----------
 
-DATA_DIR = HERE / "data"
-GOLD_ORDER_PATH = DATA_DIR / "gold_master_order.txt"
-GOLD_ROSTER_PATH = DATA_DIR / "gold_master_roster.csv"
+ROOT = Path(__file__).resolve().parent.parent  # repo root (.. from app/)
+TEMPLATE_PATH = ROOT / "wbs_template.xlsx"
+GOLD_MASTER_ORDER_PATH = ROOT / "gold_master_order.txt"
 
-# WBS layout (column indices begin at 1). Adjust if your template moves.
-WBS_DATA_START_ROW = 8  # first employee data row in the template
-# Logical “named columns” -> Excel column numbers for the Weekly sheet
-COL = {
-    "SSN": 1,              # A
-    "EMPLOYEE": 2,         # B
-    "STATUS": 3,           # C
-    "TYPE": 4,             # D
-    "PAY_RATE": 5,         # E
-    "DEPT": 6,             # F
-    "REG": 7,              # G  (A01)
-    "OT": 8,               # H  (A02)
-    "DT": 9,               # I  (A03)
-    "VACATION": 10,        # J  (A06)
-    "SICK": 11,            # K  (A07)
-    "HOLIDAY": 12,         # L  (A08)
-    "BONUS": 13,           # M  (A04)
-    "COMMISSION": 14,      # N  (A05)
-    # Piecework (Mon..Fri hours and totals) – use as available
-    "PC_HRS_MON": 35,      # AI1 (example slot)
-    "PC_TTL_MON": 36,      # AJ1
-    "PC_HRS_TUE": 37,      # AK1
-    "PC_TTL_TUE": 38,      # AL1
-    "PC_HRS_WED": 39,      # AM1
-    "PC_TTL_WED": 40,      # AN1
-    "PC_HRS_THU": 41,      # AO1
-    "PC_TTL_THU": 42,      # AP1
-    "PC_HRS_FRI": 43,      # AQ1
-    "PC_TTL_FRI": 44,      # AR1
-    "TRAVEL": 45,          # AS
-    "NOTES": 46,           # AT
-    "TOTALS": 48,          # AV (pink totals at far right)
+WBS_REQUIRED_HEADERS = {
+    "SSN": ("SSN",),
+    "EMP_NAME": ("Employee Name", "Employee"),
+    "STATUS": ("Status",),
+    "TYPE": ("Type", "Pay Type"),
+    "PAY_RATE": ("Pay Rate", "Rate"),
+    "DEPT": ("Dept", "Department"),
+    "REG": ("REG", "A01", "REGULAR"),
+    "OT": ("OT", "A02", "OVERTIME"),
+    "DT": ("DT", "A03", "DOUBLETIME"),
+    "VAC": ("VACATION", "A06"),
+    "SICK": ("SICK", "A07"),
+    "HOL": ("HOLIDAY", "A08"),
+    "TOTALS": ("TOTALS", "Totals"),
 }
 
-# Sierra file expected headers -> our canonical names
-# If Jeff’s headers vary slightly, add alternates in the lists.
-SIERRA_HEADER_MAP: Dict[str, List[str]] = {
-    "employee": ["Employee", "Employee Name", "Name"],
-    "status": ["Status"],
-    "type": ["Type", "Pay Type"],
-    "dept": ["Dept", "Department"],
-    "rate": ["Rate", "Pay Rate", "Pay Rate Dept", "Pay Rate Dept "],
-    "reg": ["REG", "REGULAR", "A01", "Regular (A01)"],
-    "ot": ["OT", "OVERTIME", "A02", "Overtime (A02)"],
-    "dt": ["DT", "DOUBLETIME", "A03", "Doubletime (A03)"],
-    "vacation": ["VACATION", "A06"],
-    "sick": ["SICK", "A07"],
-    "holiday": ["HOLIDAY", "A08"],
-    "bonus": ["BONUS", "A04"],
-    "commission": ["COMMISSION", "A05"],
-    "pc_hrs_mon": ["PC HRS MON", "AH1", "PC HRS MON (AH1)"],
-    "pc_ttl_mon": ["PC TTL MON", "AI1"],
-    "pc_hrs_tue": ["PC HRS TUE", "AJ2", "PC HRS TUE (AJ2)"],
-    "pc_ttl_tue": ["PC TTL TUE", "AK2"],
-    "pc_hrs_wed": ["PC HRS WED", "AI3", "PC HRS WED (AI3)"],
-    "pc_ttl_wed": ["PC TTL WED", "AJ3"],
-    "pc_hrs_thu": ["PC HRS THU", "AH4", "PC HRS THU (AH4)"],
-    "pc_ttl_thu": ["PC TTL THU", "AI4"],
-    "pc_hrs_fri": ["PC HRS FRI", "AH5", "PC HRS FRI (AH5)"],
-    "pc_ttl_fri": ["PC TTL FRI", "AI5"],
-    "travel": ["TRAVEL AMOUNT", "ATE", "Travel Amount"],
-    "notes": ["Notes", "Comments", "Notes and Comments"],
+NUMERIC_DEFAULTS = {
+    "REG": 0.0, "OT": 0.0, "DT": 0.0, "VAC": 0.0, "SICK": 0.0, "HOL": 0.0
 }
 
-# ---------- helpers ----------
-
-def _normalize_name(name: str) -> str:
-    """Normalize employee display names to a consistent 'Last, First' style if possible."""
+def normalize_name(name: str) -> str:
     if not isinstance(name, str):
         return ""
-    s = name.strip()
-    # Already in "Last, First"
-    if "," in s:
-        return " ".join(part.strip() for part in s.split(",")).replace("  ", " ")
-    # Try "First Last" -> "Last, First"
-    parts = [p for p in s.split() if p]
-    if len(parts) >= 2:
-        first = " ".join(parts[:-1])
-        last = parts[-1]
-        return f"{last}, {first}"
-    return s
+    # Collapse spaces, remove stray commas at ends, title case common format
+    n = re.sub(r"\s+", " ", name).strip()
+    return n
 
-
-def _pick_first_present(df: pd.DataFrame, candidates: List[str]) -> str | None:
-    for c in candidates:
-        if c in df.columns:
-            return c
-        # tolerant check (sometimes Excel exports trail/lead spaces)
-        for col in df.columns:
-            if col.strip().lower() == c.strip().lower():
-                return col
+def read_gold_master_order() -> Optional[List[str]]:
+    if GOLD_MASTER_ORDER_PATH.exists():
+        names = [normalize_name(x) for x in GOLD_MASTER_ORDER_PATH.read_text(encoding="utf-8").splitlines() if x.strip()]
+        return names if names else None
     return None
 
+# ---------- Input detection & parsing (Timesheet Stack) ----------
 
-def _rename_headers(df: pd.DataFrame) -> pd.DataFrame:
-    mapping = {}
-    for key, candidates in SIERRA_HEADER_MAP.items():
-        col = _pick_first_present(df, candidates)
-        if col is not None:
-            mapping[col] = key
-    return df.rename(columns=mapping)
+def detect_timesheet_stack(xls: bytes) -> bool:
+    """Heuristic: first sheet has a header row with 'Days' or a date in col A and 'Hours' near the end."""
+    try:
+        df_head = pd.read_excel(io.BytesIO(xls), sheet_name=0, header=None, nrows=20)
+    except Exception:
+        return False
+    # If any row has a date-like in col 0 and somewhere 'Hours' text in header row
+    text_join = " ".join(str(x) for x in df_head.fillna("").astype(str).values.flatten()[:200]).lower()
+    if "hours" in text_join:
+        # very loose, but good enough for your sheet
+        return True
+    return False
 
+def parse_timesheet_stack(xls: bytes) -> Tuple[Dict[str, float], Dict[str, Optional[float]]]:
+    """
+    Returns:
+      hours_by_name: sum of REG hours per employee
+      rate_by_name: latest non-null rate seen per employee
+    Sheet columns (typical):
+      0=Date, 1=Job#, 2=Name, 3=Start, 4=Lunch Start, 5=Lunch End, 6=Finish, 7=Hours, 8=Rate
+    """
+    # Read ALL sheets concatenated (the upload often has one sheet, but be safe)
+    x = pd.ExcelFile(io.BytesIO(xls))
+    frames = []
+    for s in x.sheet_names:
+        df = x.parse(s, header=None)
+        frames.append(df)
+    df_all = pd.concat(frames, ignore_index=True)
 
-def _load_gold_order() -> List[str]:
-    if not GOLD_ORDER_PATH.exists():
-        return []
-    lines = [ln.strip() for ln in GOLD_ORDER_PATH.read_text(encoding="utf-8").splitlines()]
-    return [_normalize_name(x) for x in lines if x.strip()]
+    # Try to find the "logical" columns by scanning header row containing 'Hours'
+    # We search the first ~50 rows for a row where one cell is 'Hours' (case-insensitive)
+    hours_col = None
+    name_col = None
+    rate_col = None
 
+    for r in range(min(len(df_all), 50)):
+        row = df_all.iloc[r].astype(str).str.strip().str.lower()
+        if "hours" in set(row.values):
+            # guess columns by typical positions
+            # Name is usually column 2, Hours column where 'hours' appeared, rate often next column
+            hours_col = row[row == "hours"].index[0]
+            # Name: search the same row for "name", else assume column 2
+            possible_name_idx = [i for i, v in enumerate(row.values) if v in ("name", "employee", "employee name")]
+            name_col = possible_name_idx[0] if possible_name_idx else 2
+            # Rate column: cell 'rate' on same row or hours_col+1
+            possible_rate_idx = [i for i, v in enumerate(row.values) if v in ("rate", "pay rate")]
+            rate_col = possible_rate_idx[0] if possible_rate_idx else (hours_col + 1 if hours_col is not None else 8)
+            break
 
-def _load_gold_roster() -> pd.DataFrame:
-    if not GOLD_ROSTER_PATH.exists():
-        # Empty frame with expected columns
-        return pd.DataFrame(columns=["employee", "ssn", "status", "type", "dept", "rate"])
-    df = pd.read_csv(GOLD_ROSTER_PATH, dtype=str).fillna("")
-    # normalize and coerce numerics
-    df["employee"] = df["employee"].map(_normalize_name)
-    for num in ("rate",):
-        if num in df.columns:
-            df[num] = pd.to_numeric(df[num], errors="coerce").fillna(0.0)
-    return df
+    # Fallback positions if header row not found
+    if hours_col is None: hours_col = 7
+    if name_col is None: name_col = 2
+    if rate_col is None: rate_col = 8
 
+    # Data rows are where Hours is numeric and Name is non-empty
+    df_data = df_all.copy()
+    # Coerce numeric
+    df_data["HOURS"] = pd.to_numeric(df_data.iloc[:, hours_col], errors="coerce")
+    df_data["RATE"] = pd.to_numeric(df_data.iloc[:, rate_col], errors="coerce")
+    df_data["NAME"] = df_data.iloc[:, name_col].astype(str).map(normalize_name)
 
-def _aggregate_sierra(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename headers, normalize names, coerce numerics, and aggregate multiple rows per employee."""
-    df = _rename_headers(df).copy()
+    df_data = df_data[(df_data["HOURS"].notna()) & (df_data["HOURS"] > 0) & (df_data["NAME"] != "")]
+    if df_data.empty:
+        raise HTTPException(status_code=422, detail="Could not locate any timesheet rows with names and hours.")
 
-    # Must have at least employee column
-    if "employee" not in df.columns:
-        raise ValueError("Could not find an 'Employee' column in the uploaded Sierra file.")
+    # Aggregate hours & pick last non-null rate per employee
+    hours_by_name = df_data.groupby("NAME")["HOURS"].sum().to_dict()
+    # Last non-null rate per employee (by appearance)
+    rate_by_name: Dict[str, Optional[float]] = {}
+    for _, row in df_data[df_data["RATE"].notna()][["NAME", "RATE"]].iterrows():
+        rate_by_name[row["NAME"]] = float(row["RATE"])
 
-    df["employee"] = df["employee"].map(_normalize_name)
+    return hours_by_name, rate_by_name
 
-    # Default numeric columns
-    numeric_keys = [
-        "reg", "ot", "dt", "vacation", "sick", "holiday",
-        "bonus", "commission",
-        "pc_hrs_mon", "pc_ttl_mon",
-        "pc_hrs_tue", "pc_ttl_tue",
-        "pc_hrs_wed", "pc_ttl_wed",
-        "pc_hrs_thu", "pc_ttl_thu",
-        "pc_hrs_fri", "pc_ttl_fri",
-        "travel",
-    ]
-    for k in numeric_keys:
-        if k not in df.columns:
-            df[k] = 0
-        df[k] = pd.to_numeric(df[k], errors="coerce").fillna(0.0)
+# ---------- Template scanning & writing ----------
 
-    # Keep text fields if present
-    if "notes" not in df.columns:
-        df["notes"] = ""
+def find_header_row_and_cols(ws: Worksheet) -> Tuple[int, Dict[str, int]]:
+    """
+    Locate the row containing the data headers (e.g., 'SSN', 'Employee Name', 'REG', 'TOTALS'...),
+    then build a column map.
+    """
+    # search first 80 rows for the header that contains "Employee Name"
+    header_row = None
+    for r in range(1, min(80, ws.max_row) + 1):
+        labels = [str(ws.cell(r, c).value).strip() if ws.cell(r, c).value is not None else "" for c in range(1, ws.max_column + 1)]
+        joined = " | ".join(labels).lower()
+        if "employee name" in joined or "employee" in joined and "ssn" in joined:
+            header_row = r
+            break
+    if header_row is None:
+        raise HTTPException(status_code=500, detail="Could not find header row in WBS template (looked for 'Employee Name').")
 
-    # Status/Type/Dept/Rate may exist in Sierra; keep but will be overridden by gold roster if present
-    if "status" not in df.columns: df["status"] = ""
-    if "type" not in df.columns: df["type"] = ""
-    if "dept" not in df.columns: df["dept"] = ""
-    if "rate" not in df.columns: df["rate"] = 0.0
-    df["rate"] = pd.to_numeric(df["rate"], errors="coerce").fillna(0.0)
-
-    # Aggregate duplicates by employee (sum numeric, keep first text)
-    agg_map = {k: "sum" for k in numeric_keys + ["rate"]}
-    agg_map.update({"status": "first", "type": "first", "dept": "first", "notes": "first"})
-    grouped = df.groupby("employee", dropna=False, as_index=False).agg(agg_map)
-
-    return grouped
-
-
-def _enrich_with_roster(sierra: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
-    """Left-join Sierra employees to gold roster to get SSN/Status/Type/Dept/Rate overrides."""
-    # roster columns: employee, ssn, status, type, dept, rate
-    if not {"employee"}.issubset(set(roster.columns)):
-        # If roster missing, just attach empty columns
-        sierra["ssn"] = ""
-        return sierra
-
-    merged = sierra.merge(roster, on="employee", how="left", suffixes=("", "_roster"))
-
-    # Prefer roster values where present
-    def coalesce(a, b):
-        return b if (b not in [None, "", 0, 0.0] and not (isinstance(b, float) and math.isnan(b))) else a
-
-    out_rows = []
-    for _, row in merged.iterrows():
-        row = row.copy()
-        row["ssn"] = row.get("ssn", "")
-        for fld in ("status", "type", "dept"):
-            row[fld] = coalesce(row.get(fld), row.get(f"{fld}_roster"))
-        # pay rate: prefer roster rate if non-zero
-        roster_rate = row.get("rate_roster", 0.0)
-        row["rate"] = roster_rate if pd.notna(roster_rate) and float(roster_rate) > 0 else row.get("rate", 0.0)
-        out_rows.append(row)
-    out = pd.DataFrame(out_rows)
-
-    # Clean temporary *_roster columns
-    for c in list(out.columns):
-        if c.endswith("_roster"):
-            out.drop(columns=c, inplace=True, errors="ignore")
-    return out
-
-
-def _apply_gold_order(df: pd.DataFrame, order_list: List[str]) -> pd.DataFrame:
-    if not order_list:
-        # fallback: keep current order (which is by first appearance in Sierra)
-        return df
-    order_index = {name: i for i, name in enumerate(order_list)}
-    df["_ord"] = df["employee"].map(lambda n: order_index.get(n, 10_000_000))
-    df.sort_values(by=["_ord", "employee"], inplace=True)
-    df.drop(columns=["_ord"], inplace=True)
-    return df
-
-
-def _safe_clear_data(ws: Worksheet, start_row: int, last_col: int) -> None:
-    """Blank out existing data rows without touching merged cell definitions."""
-    max_row = ws.max_row
-    if max_row < start_row:
-        return
-    for r in range(start_row, max_row + 1):
-        # If entire row is already blank up to last_col, skip
-        try:
-            row_empty = True
-            for c in range(1, last_col + 1):
-                cell = ws.cell(row=r, column=c)
-                if cell.value not in (None, ""):
-                    row_empty = False
-                    break
-            if row_empty:
-                continue
-            # Clear values only; avoid merged range write issues by try/except
-            for c in range(1, last_col + 1):
-                try:
-                    ws.cell(row=r, column=c).value = None
-                except AttributeError:
-                    # merged 'value' is read-only — skip
-                    continue
-        except Exception:
-            # Be defensive; continue clearing other rows
+    # Build column map by matching against required header keywords
+    col_map: Dict[str, int] = {}
+    for c in range(1, ws.max_column + 1):
+        raw = ws.cell(header_row, c).value
+        if raw is None:
             continue
+        text = str(raw).strip().upper()
+        for key, aliases in WBS_REQUIRED_HEADERS.items():
+            if key in col_map:
+                continue
+            for al in aliases:
+                if al.upper() == text:
+                    col_map[key] = c
+                    break
 
+    # Minimal columns we truly must have
+    for k in ("EMP_NAME", "REG", "TOTALS"):
+        if k not in col_map:
+            raise HTTPException(status_code=500, detail=f"Template missing required column: {k}")
 
-def _write_weekly(ws: Worksheet, df: pd.DataFrame) -> None:
-    """Write the prepared frame to the Weekly sheet according to COL mapping."""
-    current_row = WBS_DATA_START_ROW
+    return header_row, col_map
 
-    def w(row, key, col_key):
-        val = row.get(key, "")
-        try:
-            ws.cell(row=current_row, column=COL[col_key]).value = val
-        except AttributeError:
-            # handle merged read-only cells gracefully
-            pass
+def clear_old_data(ws: Worksheet, header_row: int, col_map: Dict[str, int]) -> None:
+    """
+    Clear previous data rows (values only) between data start and the row above the Totals
+    without touching merged header cells.
+    """
+    data_start = header_row + 1
+    emp_col = col_map["EMP_NAME"]
+    totals_row_guess = ws.max_row
 
-    for _, row in df.iterrows():
-        # Basic identity columns
-        w(row, "ssn", "SSN")
-        w(row, "employee", "EMPLOYEE")
-        w(row, "status", "STATUS")
-        w(row, "type", "TYPE")
-        w(row, "rate", "PAY_RATE")
-        w(row, "dept", "DEPT")
+    # Try to locate a "Totals" label in the EMP_NAME column to stop earlier
+    for r in range(ws.max_row, data_start, -1):
+        val = ws.cell(r, emp_col).value
+        if isinstance(val, str) and val.strip().lower().startswith("totals"):
+            totals_row_guess = r
+            break
 
-        # Hours/quantities & amounts
-        w(row, "reg", "REG")
-        w(row, "ot", "OT")
-        w(row, "dt", "DT")
-        w(row, "vacation", "VACATION")
-        w(row, "sick", "SICK")
-        w(row, "holiday", "HOLIDAY")
-        w(row, "bonus", "BONUS")
-        w(row, "commission", "COMMISSION")
+    # Define the columns we will clear (safe numeric/text columns)
+    data_cols = sorted(set(col_map.values()))
+    for r in range(data_start, totals_row_guess):
+        # if the entire row is empty already, skip
+        if all((ws.cell(r, c).value in (None, "")) for c in data_cols):
+            continue
+        for c in data_cols:
+            cell = ws.cell(r, c)
+            # Only clear if not part of a merged range or the top-left of that range
+            is_merged = False
+            for mr in ws.merged_cells.ranges:
+                if (mr.min_row <= r <= mr.max_row) and (mr.min_col <= c <= mr.max_col):
+                    is_merged = True
+                    if not (r == mr.min_row and c == mr.min_col):
+                        # skip non-master merged cells
+                        pass
+                    else:
+                        cell.value = None
+                    break
+            if not is_merged:
+                cell.value = None
 
-        # Piecework, travel, notes (if present)
-        w(row, "pc_hrs_mon", "PC_HRS_MON"); w(row, "pc_ttl_mon", "PC_TTL_MON")
-        w(row, "pc_hrs_tue", "PC_HRS_TUE"); w(row, "pc_ttl_tue", "PC_TTL_TUE")
-        w(row, "pc_hrs_wed", "PC_HRS_WED"); w(row, "pc_ttl_wed", "PC_TTL_WED")
-        w(row, "pc_hrs_thu", "PC_HRS_THU"); w(row, "pc_ttl_thu", "PC_TTL_THU")
-        w(row, "pc_hrs_fri", "PC_HRS_FRI"); w(row, "pc_ttl_fri", "PC_TTL_FRI")
-        w(row, "travel", "TRAVEL")
-        w(row, "notes", "NOTES")
+def build_output_rows(hours_by_name: Dict[str, float],
+                      rate_by_name: Dict[str, Optional[float]],
+                      master_order: Optional[List[str]]) -> List[Dict[str, object]]:
+    # sort by master order if provided
+    names = list(hours_by_name.keys())
+    if master_order:
+        order_index = {normalize_name(n): i for i, n in enumerate(master_order)}
+        names.sort(key=lambda n: (order_index.get(normalize_name(n), 10_000), normalize_name(n)))
+    else:
+        names.sort(key=lambda n: normalize_name(n))
 
-        # Totals (dollars) – pay rate driven
-        rate = float(row.get("rate", 0.0) or 0.0)
-        reg = float(row.get("reg", 0.0) or 0.0)
-        ot = float(row.get("ot", 0.0) or 0.0)
-        dt = float(row.get("dt", 0.0) or 0.0)
-        vacation = float(row.get("vacation", 0.0) or 0.0)
-        sick = float(row.get("sick", 0.0) or 0.0)
-        holiday = float(row.get("holiday", 0.0) or 0.0)
-        bonus = float(row.get("bonus", 0.0) or 0.0)
-        commission = float(row.get("commission", 0.0) or 0.0)
-        travel = float(row.get("travel", 0.0) or 0.0)
+    rows = []
+    for name in names:
+        row = {
+            "SSN": "",  # unknown yet
+            "EMP_NAME": name,
+            "STATUS": "",  # unknown
+            "TYPE": "",    # unknown
+            "PAY_RATE": rate_by_name.get(name),
+            "DEPT": "",
+            "REG": float(hours_by_name.get(name, 0.0)),
+            "OT": 0.0,
+            "DT": 0.0,
+            "VAC": 0.0,
+            "SICK": 0.0,
+            "HOL": 0.0,
+        }
+        rows.append(row)
+    return rows
 
-        total_amt = (reg * rate) + (ot * rate * 1.5) + (dt * rate * 2.0) \
-                    + (vacation * rate) + (sick * rate) + (holiday * rate) \
-                    + bonus + commission + travel
+def write_to_template(rows: List[Dict[str, object]]) -> bytes:
+    if not TEMPLATE_PATH.exists():
+        raise HTTPException(status_code=500, detail=f"WBS template not found at {TEMPLATE_PATH}")
 
-        try:
-            ws.cell(row=current_row, column=COL["TOTALS"]).value = round(total_amt, 2)
-        except AttributeError:
-            pass
+    wb = load_workbook(str(TEMPLATE_PATH))
+    ws = wb.active
 
-        current_row += 1
+    header_row, col_map = find_header_row_and_cols(ws)
+    clear_old_data(ws, header_row, col_map)
 
+    data_start = header_row + 1
+    r = data_start
+
+    # Write rows – leave TOTALS column untouched (template formulas)
+    for item in rows:
+        for key, default in NUMERIC_DEFAULTS.items():
+            if key not in item or item[key] is None:
+                item[key] = default
+
+        def _set(col_key: str, value):
+            if col_key not in col_map:
+                return
+            c = col_map[col_key]
+            cell = ws.cell(r, c)
+            # avoid writing into merged non-master cells
+            for mr in ws.merged_cells.ranges:
+                if mr.min_row <= r <= mr.max_row and mr.min_col <= c <= mr.max_col:
+                    if not (r == mr.min_row and c == mr.min_col):
+                        return
+                    break
+            cell.value = value
+
+        _set("SSN", item.get("SSN"))
+        _set("EMP_NAME", item.get("EMP_NAME"))
+        _set("STATUS", item.get("STATUS"))
+        _set("TYPE", item.get("TYPE"))
+        _set("PAY_RATE", item.get("PAY_RATE"))
+        _set("DEPT", item.get("DEPT"))
+        _set("REG", item.get("REG"))
+        _set("OT", item.get("OT"))
+        _set("DT", item.get("DT"))
+        _set("VAC", item.get("VAC"))
+        _set("SICK", item.get("SICK"))
+        _set("HOL", item.get("HOL"))
+        # DO NOT touch TOTALS – keep template formula
+        r += 1
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.read()
 
 # ---------- API ----------
 
@@ -344,63 +305,38 @@ def _write_weekly(ws: Worksheet, df: pd.DataFrame) -> None:
 def health():
     return {"status": "ok"}
 
-
 @app.post("/process-payroll")
-async def process_payroll(file: UploadFile = File(...)) -> Response:
-    # Basic validations
-    if not file.filename.lower().endswith((".xlsx", ".xls")):
-        raise HTTPException(status_code=422, detail="Please upload an Excel file (.xlsx or .xls).")
-
-    # Read Sierra file into DataFrame
+async def process_payroll(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        sierra_df = pd.read_excel(io.BytesIO(contents), engine="openpyxl")
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Could not read Excel: {e}")
+        if not contents:
+            raise HTTPException(status_code=422, detail="Empty file.")
 
-    try:
-        # Aggregate and normalize Sierra
-        sierra_agg = _aggregate_sierra(sierra_df)
+        if not detect_timesheet_stack(contents):
+            raise HTTPException(
+                status_code=422,
+                detail="File format error - expected Sierra timesheet stack (with 'Hours' column).",
+            )
 
-        # Enrich with gold roster
-        roster_df = _load_gold_roster()
-        enriched = _enrich_with_roster(sierra_agg, roster_df)
+        hours_by_name, rate_by_name = parse_timesheet_stack(contents)
+        master_order = read_gold_master_order()
+        rows = build_output_rows(hours_by_name, rate_by_name, master_order)
+        output_bytes = write_to_template(rows)
 
-        # Apply gold order
-        order_list = _load_gold_order()
-        ordered = _apply_gold_order(enriched, order_list)
+        filename = "WBS_Payroll_Output.xlsx"
+        return StreamingResponse(
+            io.BytesIO(output_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
 
-        # Load WBS template
-        if not TEMPLATE_PATH.exists():
-            raise HTTPException(status_code=500, detail=f"WBS template not found at {TEMPLATE_PATH}")
-        wb = load_workbook(str(TEMPLATE_PATH))
-        ws = wb.active  # Weekly sheet (single-sheet template)
-
-        # Clear old rows safely (preserve styles & merged cells)
-        _safe_clear_data(ws, WBS_DATA_START_ROW, COL["TOTALS"])
-
-        # Write rows
-        _write_weekly(ws, ordered)
-
-        # Save to bytes
-        out_stream = io.BytesIO()
-        wb.save(out_stream)
-        out_stream.seek(0)
     except HTTPException:
         raise
     except Exception as e:
-        # Bubble a concise error to the UI with enough info
-        raise HTTPException(status_code=500, detail=f"Backend processing failed: {e}")
+        # Bubble a clean 500 to the UI with a short message
+        raise HTTPException(status_code=500, detail=f"backend processing failed: {e}")
 
-    headers = {
-        "Content-Disposition": f'attachment; filename="WBS_Payroll.xlsx"'
-    }
-    return Response(content=out_stream.read(),
-                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    headers=headers)
-
-
-# --- local run ---
+# ---------- Local dev ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host="0.0.0.0", port=8080, reload=False)
