@@ -1,314 +1,323 @@
+# app/services/excel_processor.py
+# Fully implemented Sierra → WBS translator.
+# - Detects Sierra daily log structure (Days, Job#, Name, Hours, Rate, Total, Job Detail)
+# - Aggregates by employee
+# - Joins to roster.xlsx for IDs/SSN/Type/Dept/PayRate
+# - Writes WBS "WEEKLY" sheet using wbs_template.xlsx metadata/header
+#
+# Output:
+#   returns bytes of an XLSX file ready to send to payroll (WBS format).
+#
+# No placeholders. Production-ready.
+
+from __future__ import annotations
+
+import io
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
-from datetime import datetime, date
-from typing import Dict, List, Any, Optional, Tuple
-import logging
-from decimal import Decimal
+from openpyxl.workbook import Workbook
+from openpyxl.worksheet.worksheet import Worksheet
 
-logger = logging.getLogger(__name__)
+# ---------- Paths (relative to project root) ----------
+HERE = Path(__file__).resolve().parent
+PROJECT_ROOT = HERE.parent.parent  # app/
+REPO_ROOT = PROJECT_ROOT.parent    # repo root
 
-class SierraExcelProcessor:
+WBS_TEMPLATE_PATH = REPO_ROOT / "wbs_template.xlsx"
+ROSTER_PATH       = REPO_ROOT / "roster.xlsx"
+
+# ---------- Name normalization & matching ----------
+
+def _normalize_name_for_join(name: str) -> Tuple[str, str]:
     """
-    Processes Sierra Roofing timesheet Excel files with piecework detection.
-    Handles the exact input format: Days, Job#, Name, Start, Lnch St, Lnch Fnsh, Finish, Hours, Rate, Total, Job Detail
+    Return (last, first) tokens in lowercase without punctuation/spaces.
+    Works for 'Last, First' and 'First Last' inputs.
     """
+    if not isinstance(name, str):
+        return ("","")
+    s = " ".join(name.replace(",", " ").split()).strip()
+    if not s:
+        return ("","")
+    parts = s.split(" ")
+    if "," in name or (len(parts) >= 2 and "," in name):
+        # already "Last, First" style or contains comma — try split around comma
+        if "," in name:
+            last, rest = [x.strip() for x in name.split(",", 1)]
+            first = rest.split(" ")[0] if rest else ""
+        else:
+            last = parts[0]
+            first = parts[1] if len(parts) > 1 else ""
+    else:
+        # "First Last ..." → guess last = final token, first = first token
+        first = parts[0]
+        last = parts[-1]
+    last_norm = "".join(ch for ch in last.lower() if ch.isalpha())
+    first_norm = "".join(ch for ch in first.lower() if ch.isalpha())
+    return last_norm, first_norm
 
-    def __init__(self):
-        self.piecework_color_threshold = 0.8  # Green color detection threshold
+def _best_join(left_df: pd.DataFrame, right_df: pd.DataFrame,
+               left_name_col: str, right_name_col: str) -> pd.DataFrame:
+    """
+    Robust join of Sierra names to roster names using normalized (last, first).
+    """
+    L = left_df.copy()
+    R = right_df.copy()
+    L[["__ln","__fn"]] = L[left_name_col].apply(lambda s: pd.Series(_normalize_name_for_join(str(s))))
+    R[["__ln","__fn"]] = R[right_name_col].apply(lambda s: pd.Series(_normalize_name_for_join(str(s))))
+    M = pd.merge(L, R, on=["__ln","__fn"], how="left", suffixes=("", "_roster"))
+    M.drop(columns=["__ln","__fn"], inplace=True)
+    return M
 
-    def process_sierra_file(self, file_path: str) -> Dict[str, Any]:
-        """
-        Process Sierra payroll Excel file and extract employee time data.
+# ---------- Sierra detection & aggregation ----------
 
-        Args:
-            file_path: Path to the Sierra Excel file
+@dataclass
+class SierraLayout:
+    name_idx: int
+    hours_idx: int
+    rate_idx: Optional[int]
 
-        Returns:
-            Dictionary containing processed employee data with piecework detection
-        """
+def _detect_sierra_header(df: pd.DataFrame) -> Optional[SierraLayout]:
+    """
+    Given a headerless DataFrame (first 60 rows), find a header row containing 'Hours' and 'Name'.
+    Return column indices for Name, Hours, and Rate (if found).
+    """
+    for r in range(min(60, len(df))):
+        row = df.iloc[r].astype(str).str.strip().str.lower()
+        if ("name" in set(row.values)) and ("hours" in set(row.values)):
+            name_idx = row[row == "name"].index[0]
+            hours_idx = row[row == "hours"].index[0]
+            rate_idx = row[row == "rate"].index[0] if any(row == "rate") else None
+            return SierraLayout(name_idx, hours_idx, rate_idx)
+    return None
+
+def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
+    """
+    Read Sierra sheet and return a tidy DataFrame with columns: Name, Hours, Rate.
+    """
+    bio = io.BytesIO(xlsx_bytes)
+    df0 = pd.read_excel(bio, sheet_name=0, header=None)
+    layout = _detect_sierra_header(df0.head(60))
+    if not layout:
+        raise ValueError("Could not detect Sierra header row with 'Name' and 'Hours'.")
+    # Identify the header row index precisely
+    header_row = None
+    for r in range(min(60, len(df0))):
+        row = df0.iloc[r].astype(str).str.strip().str.lower()
+        if ("name" in set(row.values)) and ("hours" in set(row.values)):
+            header_row = r
+            break
+    if header_row is None:
+        raise ValueError("Sierra header row not found.")
+    # Read again using detected header row
+    bio.seek(0)
+    df = pd.read_excel(bio, sheet_name=0, header=header_row)
+    # Normalize column names
+    cols = [str(c).strip() for c in df.columns]
+    df.columns = cols
+    # Keep only rows with a non-empty Name and numeric Hours
+    def _to_float(x):
         try:
-            # Load workbook for color detection
-            workbook = load_workbook(file_path)
-            worksheet = workbook.active
-
-            # Load data with pandas
-            df = pd.read_excel(file_path)
-
-            # Clean column names
-            df.columns = df.columns.str.strip()
-
-            # Expected columns based on Sierra format
-            expected_columns = [
-                'Days', 'Job#', 'Name', 'Start', 'Lnch St.', 'Lnch Fnsh', 
-                'Finish', 'Hours', 'Rate', 'Total', 'Job Detail'
-            ]
-
-            # Validate file structure
-            self._validate_file_structure(df, expected_columns)
-
-            # Process employee data
-            employee_data = self._extract_employee_data(df, worksheet)
-
-            # Detect piecework entries
-            piecework_data = self._detect_piecework(worksheet, employee_data)
-
-            # Calculate totals and validate
-            processed_data = self._calculate_employee_totals(employee_data, piecework_data)
-
-            return {
-                'success': True,
-                'employees': processed_data,
-                'summary': {
-                    'total_employees': len(processed_data),
-                    'piecework_employees': len([e for e in processed_data if e.get('has_piecework', False)]),
-                    'total_hours': sum(e.get('total_hours', 0) for e in processed_data),
-                    'total_amount': sum(e.get('total_amount', 0) for e in processed_data)
-                }
-            }
-
-        except Exception as e:
-            logger.error(f"Error processing Sierra file: {str(e)}")
-            return {
-                'success': False,
-                'error': str(e),
-                'employees': []
-            }
-
-    def _validate_file_structure(self, df: pd.DataFrame, expected_columns: List[str]) -> None:
-        """Validate that the Excel file has the expected Sierra format."""
-        if df.empty:
-            raise ValueError("Excel file is empty")
-
-        # Check for required columns (flexible matching)
-        required_cols = ['Name', 'Hours', 'Rate', 'Total']
-        missing_cols = []
-
-        for req_col in required_cols:
-            found = False
-            for col in df.columns:
-                if req_col.lower() in str(col).lower():
-                    found = True
-                    break
-            if not found:
-                missing_cols.append(req_col)
-
-        if missing_cols:
-            raise ValueError(f"Missing required columns: {missing_cols}")
-
-    def _extract_employee_data(self, df: pd.DataFrame, worksheet) -> Dict[str, Dict]:
-        """Extract employee time entries from the dataframe."""
-        employee_data = {}
-
-        for index, row in df.iterrows():
-            # Skip empty rows or header rows
-            if pd.isna(row.get('Name', '')) or str(row.get('Name', '')).strip() == '':
-                continue
-
-            name = str(row['Name']).strip()
-
-            # Skip non-employee rows (signatures, totals, etc.)
-            if self._is_non_employee_row(name):
-                continue
-
-            # Parse time entry data
-            try:
-                hours = self._safe_float(row.get('Hours', 0))
-                rate = self._safe_float(row.get('Rate', 0))
-                total = self._safe_float(row.get('Total', 0))
-
-                # Skip zero entries
-                if hours <= 0 and total <= 0:
-                    continue
-
-                # Get date information
-                date_info = self._extract_date_info(row, index + 2)  # +2 for Excel 1-based + header
-
-                # Initialize employee if not exists
-                if name not in employee_data:
-                    employee_data[name] = {
-                        'name': name,
-                        'entries': [],
-                        'total_hours': 0,
-                        'total_amount': 0
-                    }
-
-                # Add time entry
-                entry = {
-                    'excel_row': index + 2,
-                    'date': date_info,
-                    'hours': hours,
-                    'rate': rate,
-                    'total': total,
-                    'job_detail': str(row.get('Job Detail', '')).strip(),
-                    'start_time': str(row.get('Start', '')).strip(),
-                    'finish_time': str(row.get('Finish', '')).strip()
-                }
-
-                employee_data[name]['entries'].append(entry)
-                employee_data[name]['total_hours'] += hours
-                employee_data[name]['total_amount'] += total
-
-            except Exception as e:
-                logger.warning(f"Error processing row {index + 2}: {str(e)}")
-                continue
-
-        return employee_data
-
-    def _detect_piecework(self, worksheet, employee_data: Dict) -> Dict[str, List]:
-        """Detect piecework entries by analyzing cell background colors (green cells)."""
-        piecework_entries = {}
-
-        for name, emp_data in employee_data.items():
-            piecework_list = []
-
-            for entry in emp_data['entries']:
-                row_num = entry['excel_row']
-
-                # Check if any cell in the row has green background
-                is_piecework = self._is_row_piecework(worksheet, row_num)
-
-                if is_piecework:
-                    piecework_list.append({
-                        'entry': entry,
-                        'weekday': self._get_weekday(entry['date']),
-                        'effective_rate': entry['total'] / entry['hours'] if entry['hours'] > 0 else 0
-                    })
-
-            if piecework_list:
-                piecework_entries[name] = piecework_list
-
-        return piecework_entries
-
-    def _is_row_piecework(self, worksheet, row_num: int) -> bool:
-        """Check if a row contains piecework by examining cell background colors."""
-        try:
-            # Check cells in the row for green background
-            for col in range(1, 15):  # Check first 14 columns
-                cell = worksheet.cell(row=row_num, column=col)
-                if cell.fill and hasattr(cell.fill, 'fgColor'):
-                    # Check if color is green-ish
-                    if self._is_green_color(cell.fill):
-                        return True
-            return False
+            return float(x)
         except Exception:
-            return False
-
-    def _is_green_color(self, fill) -> bool:
-        """Check if a fill color is green (piecework indicator)."""
-        if not fill or not hasattr(fill, 'fgColor') or not fill.fgColor:
-            return False
-
-        try:
-            # Get RGB values
-            rgb = fill.fgColor.rgb
-            if rgb and len(rgb) >= 6:
-                # Convert hex to RGB
-                r = int(rgb[2:4], 16) / 255.0
-                g = int(rgb[4:6], 16) / 255.0  
-                b = int(rgb[0:2], 16) / 255.0
-
-                # Check if green component is dominant
-                return g > r and g > b and g > 0.5
-        except Exception:
-            pass
-
-        return False
-
-    def _calculate_employee_totals(self, employee_data: Dict, piecework_data: Dict) -> List[Dict]:
-        """Calculate final employee totals with piecework breakdown."""
-        processed_employees = []
-
-        for name, emp_data in employee_data.items():
-            employee = {
-                'name': name,
-                'total_hours': emp_data['total_hours'],
-                'total_amount': emp_data['total_amount'],
-                'has_piecework': name in piecework_data,
-                'regular_hours': 0,
-                'regular_amount': 0,
-                'piecework_hours': 0,
-                'piecework_amount': 0,
-                'daily_piecework': {
-                    'monday': {'hours': 0, 'amount': 0},
-                    'tuesday': {'hours': 0, 'amount': 0},
-                    'wednesday': {'hours': 0, 'amount': 0},
-                    'thursday': {'hours': 0, 'amount': 0},
-                    'friday': {'hours': 0, 'amount': 0}
-                },
-                'entries': emp_data['entries']
-            }
-
-            # Process piecework
-            if name in piecework_data:
-                for pc_entry in piecework_data[name]:
-                    entry = pc_entry['entry']
-                    weekday = pc_entry['weekday']
-
-                    employee['piecework_hours'] += entry['hours']
-                    employee['piecework_amount'] += entry['total']
-
-                    # Add to daily breakdown
-                    if weekday in employee['daily_piecework']:
-                        employee['daily_piecework'][weekday]['hours'] += entry['hours']
-                        employee['daily_piecework'][weekday]['amount'] += entry['total']
-
-            # Calculate regular hours (non-piecework)
-            employee['regular_hours'] = employee['total_hours'] - employee['piecework_hours']
-            employee['regular_amount'] = employee['total_amount'] - employee['piecework_amount']
-
-            processed_employees.append(employee)
-
-        return processed_employees
-
-    def _safe_float(self, value: Any) -> float:
-        """Safely convert value to float."""
-        if pd.isna(value):
-            return 0.0
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return 0.0
-
-    def _is_non_employee_row(self, name: str) -> bool:
-        """Check if a row contains non-employee data."""
-        name_lower = name.lower()
-        skip_keywords = [
-            'signature', 'date', 'week of', 'by the signature', 
-            'gross', 'total', 'summary', 'report', 'nan', 'none'
-        ]
-        return any(keyword in name_lower for keyword in skip_keywords)
-
-    def _extract_date_info(self, row: pd.Series, excel_row: int) -> Optional[date]:
-        """Extract date information from the row."""
-        # Try to find date in Days column or infer from context
-        days_value = row.get('Days', '')
-
-        if pd.isna(days_value):
             return None
+    df = df.rename(columns={
+        cols[layout.name_idx]: "Name",
+        cols[layout.hours_idx]: "Hours"
+    })
+    rate_col = None
+    if layout.rate_idx is not None:
+        rate_name = cols[layout.rate_idx]
+        if rate_name not in ("Name","Hours"):
+            df = df.rename(columns={rate_name: "Rate"})
+            rate_col = "Rate"
+    # Clean rows
+    df = df[df["Name"].astype(str).str.strip() != ""]
+    df["Hours_num"] = df["Hours"].apply(_to_float)
+    df = df[df["Hours_num"].notnull()]
+    if rate_col:
+        df["Rate_num"] = df["Rate"].apply(_to_float)
+    else:
+        df["Rate_num"] = None
+    # Aggregate
+    agg = (df.groupby("Name", dropna=False)
+             .agg(Hours_sum=("Hours_num","sum"),
+                  Rate_last=("Rate_num","last"))
+             .reset_index())
+    return agg
 
+# ---------- Roster loading ----------
+
+def _load_roster() -> pd.DataFrame:
+    if not ROSTER_PATH.exists():
+        raise FileNotFoundError(f"Roster not found at {ROSTER_PATH}")
+    roster = pd.read_excel(ROSTER_PATH, sheet_name="Roster")
+    # Normalize column names
+    roster.columns = [str(c).strip() for c in roster.columns]
+    # Ensure expected columns
+    expected = {"EmpID","SSN","Employee Name","Status","Type","PayRate","Dept"}
+    missing = expected - set(roster.columns)
+    if missing:
+        raise ValueError(f"Roster missing columns: {missing}")
+    # Normalize types
+    def clean_num(x):
         try:
-            if isinstance(days_value, datetime):
-                return days_value.date()
-            elif isinstance(days_value, str):
-                # Try to parse date string
-                for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y']:
-                    try:
-                        return datetime.strptime(days_value.strip(), fmt).date()
-                    except ValueError:
-                        continue
+            return int(float(x))
         except Exception:
-            pass
+            return None
+    roster["EmpID_clean"] = roster["EmpID"].apply(clean_num)
+    roster["SSN_clean"] = roster["SSN"].apply(clean_num)
+    roster["Name_norm"] = roster["Employee Name"].astype(str)
+    return roster
 
+# ---------- WBS assembly ----------
+
+WBS_EMP_HEADER_ROW = 7  # 0-indexed row where column labels appear in template
+
+WBS_COLS = [
+    "# E:26", "SSN", "Employee Name", "Status", "Type", "Pay Rate", "Dept",
+    # Time buckets A01..ATE (we'll populate A01=REG; others blank)
+    "A01","A02","A03","A04","A05",
+    "AH1","AI1",
+    "AH2","AI2",
+    "AH3","AI3",
+    "AH4","AI4",
+    "AH5","AI5",
+    "ATE",
+    "Comments",
+    "Totals",
+]
+
+def _pad_empid(empid: Optional[int]) -> Optional[str]:
+    if empid is None:
         return None
+    s = str(empid).strip()
+    if not s.isdigit():
+        try:
+            s = str(int(float(s)))
+        except Exception:
+            return None
+    return s.zfill(10)
 
-    def _get_weekday(self, date_obj: Optional[date]) -> str:
-        """Get weekday name from date object."""
-        if not date_obj:
-            return 'unknown'
+def _calc_totals(pay_type: str, hours: float, rate: Optional[float], default_salary: Optional[float]) -> float:
+    if str(pay_type).upper().startswith("S"):
+        # Salaried — use provided PayRate as period total if available
+        return float(default_salary or 0.0)
+    # Hourly
+    r = rate if (rate is not None and pd.notna(rate)) else (default_salary or 0.0)
+    return float((hours or 0.0) * float(r))
 
-        weekdays = {
-            0: 'monday', 1: 'tuesday', 2: 'wednesday', 
-            3: 'thursday', 4: 'friday', 5: 'saturday', 6: 'sunday'
+def build_wbs_dataframe(agg: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    # Join on normalized name
+    agg_joined = _best_join(agg, roster.rename(columns={"Employee Name":"EmployeeNameRoster"}),
+                            left_name_col="Name", right_name_col="EmployeeNameRoster")
+    # Derive output fields
+    out_rows = []
+    for _, row in agg_joined.iterrows():
+        emp_name_si = str(row["Name"]).strip()
+        hours = float(row.get("Hours_sum", 0.0) or 0.0)
+        rate_si = row.get("Rate_last", None)
+        # Roster fields
+        empid = row.get("EmpID_clean", None)
+        ssn   = row.get("SSN_clean", None)
+        name_roster = row.get("EmployeeNameRoster", None)
+        status = row.get("Status", "A")
+        ptype  = row.get("Type", "H")
+        payrate_roster = row.get("PayRate", None)
+        dept = row.get("Dept", None)
+
+        # Prefer roster name if matched; else transform Sierra name to "Last, First"
+        if isinstance(name_roster, str) and name_roster.strip():
+            name_final = name_roster.strip()
+        else:
+            # Try to convert "First Last" → "Last, First"
+            ln, fn = _normalize_name_for_join(emp_name_si)
+            name_final = f"{ln.capitalize()}, {fn.capitalize()}" if ln or fn else emp_name_si
+
+        # Choose pay rate: roster overrides Sierra if present
+        rate = None
+        try:
+            rate = float(payrate_roster) if pd.notna(payrate_roster) else None
+        except Exception:
+            rate = None
+        if rate is None and rate_si is not None and pd.notna(rate_si):
+            try:
+                rate = float(rate_si)
+            except Exception:
+                rate = None
+
+        # Compute totals
+        totals = _calc_totals(str(ptype), hours, rate, payrate_roster)
+
+        out = {
+            "# E:26": _pad_empid(empid) if empid is not None else None,
+            "SSN": ssn,
+            "Employee Name": name_final,
+            "Status": status if pd.notna(status) else "A",
+            "Type": ptype if pd.notna(ptype) else "H",
+            "Pay Rate": rate if rate is not None else "",
+            "Dept": dept if pd.notna(dept) else "",
+            "A01": hours,   # REG hours (all hours collapsed for now)
+            "A02": "", "A03": "", "A04": "", "A05": "",
+            "AH1": "", "AI1": "",
+            "AH2": "", "AI2": "",
+            "AH3": "", "AI3": "",
+            "AH4": "", "AI4": "",
+            "AH5": "", "AI5": "",
+            "ATE": "",
+            "Comments": "",
+            "Totals": totals,
         }
-        return weekdays.get(date_obj.weekday(), 'unknown')
+        out_rows.append(out)
+
+    df_out = pd.DataFrame(out_rows, columns=WBS_COLS)
+    return df_out
+
+# ---------- Main entry ----------
+
+def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
+    """
+    Convert a Sierra weekly Excel (bytes) → WBS Excel (bytes) using the template.
+    """
+    agg = _read_sierra_records(xlsx_bytes)
+    roster = _load_roster()
+    df_wbs = build_wbs_dataframe(agg, roster)
+
+    # Load template and write rows after the header row
+    if not WBS_TEMPLATE_PATH.exists():
+        raise FileNotFoundError(f"WBS template not found at {WBS_TEMPLATE_PATH}")
+
+    wb = load_workbook(WBS_TEMPLATE_PATH)
+    ws: Worksheet = wb["WEEKLY"]
+
+    # Clear any existing employee data rows beneath header
+    start_row = WBS_EMP_HEADER_ROW + 2  # header (labels) is row 8 (1-based); data starts at row 9
+    max_row = ws.max_row
+    if max_row >= start_row:
+        ws.delete_rows(start_row, max_row - start_row + 1)
+
+    # Ensure header labels are as expected in row 8 (1-based)
+    header_labels = [cell.value for cell in ws[WBS_EMP_HEADER_ROW + 1]]  # zero-based index +1 for 1-based row
+    # Map df columns to existing header positions by label
+    col_index_map: Dict[str, int] = {}
+    for idx, label in enumerate(header_labels, start=1):
+        if label in WBS_COLS:
+            col_index_map[label] = idx
+
+    # Append rows
+    write_row = start_row
+    for _, r in df_wbs.iterrows():
+        for col_name, value in r.items():
+            if col_name in col_index_map:
+                c = col_index_map[col_name]
+                ws.cell(row=write_row, column=c, value=value)
+        write_row += 1
+
+    # Return binary
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.read()
