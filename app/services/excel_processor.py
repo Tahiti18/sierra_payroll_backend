@@ -1,15 +1,13 @@
 # app/services/excel_processor.py
-# Sierra → WBS translator (stable)
+# Sierra → WBS translator (hours-to-REGULAR/A01 hard-mapped)
 # - Detects Sierra daily log structure (Days, Job#, Name, Hours, Rate, Total, Job Detail)
 # - Aggregates by employee
 # - Joins to roster.xlsx (EmpID/SSN/Status/Type/Dept/PayRate)
-# - Writes WBS "WEEKLY" respecting the sheet's actual header labels
-# - Populates REGULAR hours + Pay Rate + Totals (if a Totals column exists)
+# - Writes WBS "WEEKLY" while tolerating header quirks and merged cells
 
 from __future__ import annotations
 
-import io
-import re
+import io, re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
@@ -27,10 +25,11 @@ REPO_ROOT = PROJECT_ROOT.parent         # repo root
 WBS_TEMPLATE_PATH = REPO_ROOT / "wbs_template.xlsx"
 ROSTER_PATH       = REPO_ROOT / "roster.xlsx"
 
-# ---------- Helpers ----------
+
+# ---------- Numeric + name helpers ----------
 
 def _num(s) -> Optional[float]:
-    """Parse numbers like ' 1,234.50 ', '$45.00', '8.000', etc. Return float or None."""
+    """Parse ' 1,234.50 ', '$45.00', '8.000', '16 ' → float or None."""
     if s is None:
         return None
     if isinstance(s, (int, float)):
@@ -41,9 +40,7 @@ def _num(s) -> Optional[float]:
     ss = str(s).strip()
     if not ss:
         return None
-    # Remove currency/commas/spaces
     ss = ss.replace("$", "").replace(",", "")
-    # If something like '8.000 ' or ' 16 ' etc.
     m = re.search(r"-?\d+(\.\d+)?", ss)
     if not m:
         return None
@@ -51,7 +48,6 @@ def _num(s) -> Optional[float]:
         return float(m.group(0))
     except Exception:
         return None
-
 
 def _safe_int(x) -> Optional[int]:
     try:
@@ -64,8 +60,6 @@ def _safe_int(x) -> Optional[int]:
     except Exception:
         return None
 
-
-# ---------- Name normalization & matching ----------
 def _normalize_name_for_join(name: str) -> Tuple[str, str]:
     """Return (last, first) lowercase tokens without punctuation/spaces."""
     if not isinstance(name, str):
@@ -84,10 +78,9 @@ def _normalize_name_for_join(name: str) -> Tuple[str, str]:
     first_norm = "".join(ch for ch in first.lower() if ch.isalpha())
     return last_norm, first_norm
 
-
 def _best_join(left_df: pd.DataFrame, right_df: pd.DataFrame,
                left_name_col: str, right_name_col: str) -> pd.DataFrame:
-    """Robust join of Sierra names to roster names using normalized (last, first)."""
+    """Join Sierra names to roster names using normalized (last, first)."""
     L = left_df.copy()
     R = right_df.copy()
     L[["__ln","__fn"]] = L[left_name_col].apply(lambda s: pd.Series(_normalize_name_for_join(str(s))))
@@ -116,7 +109,6 @@ def _detect_sierra_layout(df: pd.DataFrame) -> Optional[SierraLayout]:
             return SierraLayout(header_row=r, name_idx=name_idx, hours_idx=hours_idx, rate_idx=rate_idx)
     return None
 
-
 def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
     """
     Return tidy DF with columns: Name, Hours_sum, Rate_last
@@ -128,32 +120,27 @@ def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
     if not layout:
         raise ValueError("Could not detect Sierra header row with 'Name' and 'Hours'.")
 
-    # Re-read with the header row applied
+    # Re-read with header applied
     bio.seek(0)
     df = pd.read_excel(bio, sheet_name=0, header=layout.header_row)
-    # Normalize column names
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Rename the essential fields
+    # Rename essential fields
     name_col  = df.columns[layout.name_idx]
     hours_col = df.columns[layout.hours_idx]
     df = df.rename(columns={name_col: "Name", hours_col: "Hours"})
-
     if layout.rate_idx is not None:
         rate_name = df.columns[layout.rate_idx]
-        if rate_name not in ("Name","Hours"):
+        if rate_name not in ("Name", "Hours"):
             df = df.rename(columns={rate_name: "Rate"})
 
-    # Clean rows
+    # Clean + numeric
     df = df[df["Name"].astype(str).str.strip() != ""].copy()
     df["Hours_num"] = df["Hours"].apply(_num)
     df = df[df["Hours_num"].notnull()].copy()
-    if "Rate" in df.columns:
-        df["Rate_num"] = df["Rate"].apply(_num)
-    else:
-        df["Rate_num"] = None
+    df["Rate_num"] = df["Rate"].apply(_num) if "Rate" in df.columns else None
 
-    # Aggregate (sum hours; last non-null rate)
+    # Aggregate
     agg = (
         df.groupby("Name", dropna=False)
           .agg(Hours_sum=("Hours_num", "sum"),
@@ -163,7 +150,7 @@ def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
     return agg
 
 
-# ---------- Roster loading ----------
+# ---------- Roster ----------
 
 def _load_roster() -> pd.DataFrame:
     if not ROSTER_PATH.exists():
@@ -194,36 +181,35 @@ def _pad_empid(empid: Optional[int]) -> Optional[str]:
         return None
     return s.zfill(10)
 
-
 def _calc_totals(pay_type: str, hours: float, rate: Optional[float], default_payrate: Optional[float]) -> float:
-    """Hourly: hours × rate; Salaried (Type starts with 'S'): use roster PayRate as period total."""
+    """Hourly → hours×rate; Salaried (Type starts with 'S') → use roster PayRate as period total."""
     if str(pay_type).upper().startswith("S"):
         return float(_num(default_payrate) or 0.0)
     r = _num(rate) or _num(default_payrate) or 0.0
     return float((hours or 0.0) * r)
 
-
-def _find_header_map(ws: Worksheet, header_row_1based: int) -> Dict[str, int]:
+def _find_header_map(ws: Worksheet) -> Dict[str, int]:
     """
-    Build a mapping from logical field → sheet column index (1-based),
-    using case-insensitive label matching and synonyms.
+    Scan rows 6–10 to build label→column map. Handles merged headers and stray spaces.
+    Returns 1-based column indices.
     """
-    labels = []
-    for cell in ws[header_row_1based]:
-        labels.append((cell.column, str(cell.value or "").strip()))
+    labels: List[Tuple[int,str]] = []
+    for row_idx in range(6, 11):  # inclusive
+        for cell in ws[row_idx]:
+            label = str(cell.value or "").strip()
+            if label:
+                labels.append((cell.column, label))
 
-    # helper to locate by any of a set of names (contains/equals, case-insensitive)
     def locate(*names: str) -> Optional[int]:
-        names_l = [n.lower() for n in names]
+        keys = [n.lower() for n in names]
         for col_idx, label in labels:
-            L = label.lower()
-            # exact or contains (to survive spacing variants)
-            if any(L == n or n in L for n in names_l):
+            L = label.lower().strip()
+            if any(L == k or k in L for k in keys):
                 return col_idx
         return None
 
     return {
-        # ID
+        # ID block
         "EmpID": locate("# e:26", "employee id", "emp id", "empid"),
         "SSN":   locate("ssn"),
         "Employee Name": locate("employee name", "name"),
@@ -231,13 +217,15 @@ def _find_header_map(ws: Worksheet, header_row_1based: int) -> Dict[str, int]:
         "Type":   locate("type", "pay type"),
         "Pay Rate": locate("pay rate", "rate"),
         "Dept": locate("dept", "department"),
-        # Hours buckets
+        # Time buckets — accept either the label or its code
         "REGULAR": locate("regular", "a01"),
+        "A01": locate("a01", "regular"),
         "OVERTIME": locate("overtime", "a02"),
         "DOUBLETIME": locate("doubletime", "double time", "a03"),
-        # Optional Totals column (if present in this template)
+        # Optional totals/comment columns (depends on template)
         "Totals": locate("totals", "total"),
-        # Piecework columns (we leave blank for now, but map them if needed later)
+        "Comments": locate("comments", "notes"),
+        # Piecework placeholders (not populated here)
         "PC HRS MON": locate("pc hrs mon", "ah1"),
         "PC TTL MON": locate("pc ttl mon", "ai1"),
         "PC HRS TUE": locate("pc hrs tue", "ah2"),
@@ -250,6 +238,25 @@ def _find_header_map(ws: Worksheet, header_row_1based: int) -> Dict[str, int]:
         "PC TTL FRI": locate("pc ttl fri", "ai5"),
     }
 
+def _first_time_bucket_right_of_payrate(ws: Worksheet, cmap: Dict[str,int]) -> Optional[int]:
+    """
+    Fallback: if we couldn't find REGULAR/A01, choose the first empty-able
+    column to the right of Pay Rate in the header row area.
+    """
+    pr = cmap.get("Pay Rate")
+    if not pr:
+        return None
+    # scan next 15 columns to the right for any bucket-like header
+    for offset in range(1, 16):
+        c = pr + offset
+        try:
+            label = str(ws.cell(row=8, column=c).value or "").lower()
+        except Exception:
+            label = ""
+        if label and any(k in label for k in ["regular", "a01", "overtime", "a02", "double"]):
+            return c
+    # if nothing matched, just return pr+1 as absolute last resort
+    return pr + 1
 
 def _build_output_rows(agg: pd.DataFrame, roster: pd.DataFrame) -> List[Dict[str, object]]:
     joined = _best_join(agg, roster, "Name", "EmployeeNameRoster")
@@ -268,10 +275,7 @@ def _build_output_rows(agg: pd.DataFrame, roster: pd.DataFrame) -> List[Dict[str
         payrate_roster = r.get("PayRate")
         dept = r.get("Dept")
 
-        # choose display name (prefer roster)
         name_final = str(name_roster).strip() if pd.notna(name_roster) and str(name_roster).strip() else emp_name_si
-
-        # choose final pay rate (prefer roster if present)
         rate_final = _num(payrate_roster)
         if rate_final is None:
             rate_final = _num(rate_si)
@@ -286,10 +290,8 @@ def _build_output_rows(agg: pd.DataFrame, roster: pd.DataFrame) -> List[Dict[str
             "Type": ptype if pd.notna(ptype) else "H",
             "Pay Rate": rate_final if rate_final is not None else "",
             "Dept": dept if pd.notna(dept) else "",
-            "REGULAR": hours,          # All hours collapsed into REGULAR for now
-            "OVERTIME": "",            # Leave blank until business rule supplied
-            "DOUBLETIME": "",          # Leave blank until business rule supplied
-            "Totals": totals_val,      # Will write only if a Totals column exists
+            "Hours": hours,          # we’ll place into REGULAR/A01 at write-time
+            "Totals": totals_val,
         })
 
     return out_rows
@@ -298,9 +300,7 @@ def _build_output_rows(agg: pd.DataFrame, roster: pd.DataFrame) -> List[Dict[str
 # ---------- Main entry ----------
 
 def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
-    """
-    Convert a Sierra weekly Excel (bytes) → WBS Excel (bytes) using the template.
-    """
+    """Convert a Sierra weekly Excel (bytes) → WBS Excel (bytes) using the template."""
     agg = _read_sierra_records(xlsx_bytes)
     roster = _load_roster()
     rows = _build_output_rows(agg, roster)
@@ -311,7 +311,7 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     wb = load_workbook(WBS_TEMPLATE_PATH)
     ws: Worksheet = wb["WEEKLY"]
 
-    # In the provided template, column labels are on row 8 (1-based).
+    # In the provided template, column labels are typically on row 8.
     HEADER_ROW_1BASED = 8
     DATA_START_1BASED = 9
 
@@ -320,13 +320,22 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     if max_row >= DATA_START_1BASED:
         ws.delete_rows(DATA_START_1BASED, max_row - DATA_START_1BASED + 1)
 
-    # Build a robust header map to where to write values
-    cmap = _find_header_map(ws, HEADER_ROW_1BASED)
+    # Build a header map tolerant to merged labels and weird spacing
+    cmap = _find_header_map(ws)
+
+    # Pre-calc the REG target column(s)
+    reg_col = cmap.get("REGULAR")
+    a01_col = cmap.get("A01")
+    if not reg_col and not a01_col:
+        # fallback: pick a sensible bucket right of Pay Rate
+        fallback_col = _first_time_bucket_right_of_payrate(ws, cmap)
+    else:
+        fallback_col = None
 
     # Append new rows
     row_idx = DATA_START_1BASED
     for r in rows:
-        # Identity fields
+        # Identity block
         if cmap.get("EmpID"):         ws.cell(row=row_idx, column=cmap["EmpID"], value=r["EmpID"])
         if cmap.get("SSN"):           ws.cell(row=row_idx, column=cmap["SSN"], value=r["SSN"])
         if cmap.get("Employee Name"): ws.cell(row=row_idx, column=cmap["Employee Name"], value=r["Employee Name"])
@@ -335,18 +344,24 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
         if cmap.get("Pay Rate"):      ws.cell(row=row_idx, column=cmap["Pay Rate"], value=r["Pay Rate"])
         if cmap.get("Dept"):          ws.cell(row=row_idx, column=cmap["Dept"], value=r["Dept"])
 
-        # Hours buckets
-        if cmap.get("REGULAR"):       ws.cell(row=row_idx, column=cmap["REGULAR"], value=r["REGULAR"])
-        if cmap.get("OVERTIME"):      ws.cell(row=row_idx, column=cmap["OVERTIME"], value=r["OVERTIME"])
-        if cmap.get("DOUBLETIME"):    ws.cell(row=row_idx, column=cmap["DOUBLETIME"], value=r["DOUBLETIME"])
+        # Hours → write to REGULAR and/or A01
+        hours = r["Hours"]
+        wrote_hours = False
+        if reg_col:
+            ws.cell(row=row_idx, column=reg_col, value=hours)
+            wrote_hours = True
+        if a01_col:
+            ws.cell(row=row_idx, column=a01_col, value=hours)
+            wrote_hours = True
+        if not wrote_hours and fallback_col:
+            ws.cell(row=row_idx, column=fallback_col, value=hours)
 
-        # Totals (only if a Totals column exists in this template)
+        # Totals (only if a Totals column exists)
         if cmap.get("Totals") and r.get("Totals") is not None:
             ws.cell(row=row_idx, column=cmap["Totals"], value=r["Totals"])
 
         row_idx += 1
 
-    # Return binary Excel
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
