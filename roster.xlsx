@@ -1,0 +1,51 @@
+def _load_roster() -> pd.DataFrame:
+    """
+    Try to load roster.xlsx; if it's missing, return an empty roster so the
+    conversion proceeds using Sierra names/rates only.
+    Expected sheet/columns if present:
+      sheet 'Roster' with columns:
+      EmpID, SSN, Employee Name, Status, Type, PayRate, Dept
+    """
+    expected_cols = ["EmpID","SSN","Employee Name","Status","Type","PayRate","Dept"]
+
+    # Search a few common locations
+    candidates = [
+        ROSTER_PATH,
+        REPO_ROOT / "roster.xlsx",
+        PROJECT_ROOT / "roster.xlsx",
+        HERE / "roster.xlsx",
+        Path("/roster.xlsx"),
+    ]
+    path = next((p for p in candidates if p.exists()), None)
+
+    if path is None:
+        # Return an empty, correctly-shaped roster (non-fatal)
+        empty = pd.DataFrame(columns=expected_cols)
+        empty["EmpID_clean"] = pd.Series(dtype="Int64")
+        empty["SSN_clean"]   = pd.Series(dtype="Int64")
+        empty["EmployeeNameRoster"] = pd.Series(dtype="string")
+        return empty
+
+    # Load the real roster
+    roster = pd.read_excel(path, sheet_name="Roster")
+    roster.columns = [str(c).strip() for c in roster.columns]
+
+    missing = set(expected_cols) - set(roster.columns)
+    if missing:
+        raise ValueError(f"Roster found at {path} but missing columns: {missing}")
+
+    # Normalize types/keys
+    def _safe_int(x):
+        try:
+            if pd.isna(x): return None
+        except Exception:
+            pass
+        try:
+            return int(float(str(x).replace(",", "").strip()))
+        except Exception:
+            return None
+
+    roster["EmpID_clean"] = roster["EmpID"].apply(_safe_int)
+    roster["SSN_clean"]   = roster["SSN"].apply(_safe_int)
+    roster["EmployeeNameRoster"] = roster["Employee Name"].astype(str)
+    return roster
