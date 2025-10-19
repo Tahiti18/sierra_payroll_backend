@@ -1,8 +1,5 @@
 # app/services/excel_processor.py
-# Sierra → WBS translator with daily OT/DT allocation
-# - Detect Sierra layout (Days, Job#, Name, Hours, Rate, Total, Job Detail)
-# - Per-employee, per-day split: REG (≤8), OT (8–12), DT (>12)
-# - Join roster.xlsx, write WBS WEEKLY with robust header matching
+# Sierra → WBS translator with explicit A01/A02/A03 mapping and CA daily OT/DT.
 
 from __future__ import annotations
 
@@ -114,18 +111,15 @@ def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
         days_name = df.columns[layout.days_idx]
         df = df.rename(columns={days_name: "Days"})
 
-    # keep rows with name and numeric hours
-    df = df[df["Name"].astype(str).str.strip() != ""].copy()
+    # Clean + numeric
+    df["Name"] = df["Name"].astype(str).str.strip()
+    df = df[df["Name"] != ""].copy()
     df["Hours_num"] = df["Hours"].apply(_num)
     df = df[df["Hours_num"].notnull()].copy()
-    if "Rate" in df.columns:
-        df["Rate_num"] = df["Rate"].apply(_num)
-    else:
-        df["Rate_num"] = None
+    df["Rate_num"] = df["Rate"].apply(_num) if "Rate" in df.columns else None
 
     # Normalize date (Days) if present
     if "Days" in df.columns:
-        # try parse to date; if not present, treat as single bucket per file
         df["DayKey"] = pd.to_datetime(df["Days"], errors="coerce").dt.date
     else:
         df["DayKey"] = pd.NaT
@@ -136,7 +130,10 @@ def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
                       Rate_last=("Rate_num", "last"))
                  .reset_index())
 
-    # Split each day into REG/OT/DT (CA-style daily rule)
+    # Drop the bogus NaN-name bucket if it exists
+    per_day = per_day[per_day["Name"].notna() & (per_day["Name"].astype(str).str.strip() != "")].copy()
+
+    # Daily split (CA)
     def split_daily(h: float) -> Tuple[float,float,float]:
         if h is None: return (0.0,0.0,0.0)
         reg = min(h, 8.0)
@@ -154,6 +151,8 @@ def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
                       Rate_last=("Rate_last","last"))
                  .reset_index())
 
+    # Final cleanup: remove any NaN/blank name row
+    agg = agg[agg["Name"].notna() & (agg["Name"].astype(str).str.strip() != "")].copy()
     return agg
 
 # ---------- Roster ----------
@@ -183,11 +182,12 @@ def _pad_empid(empid: Optional[int]) -> Optional[str]:
 
 def _calc_totals(pay_type: str, reg: float, ot: float, dt: float,
                  rate: Optional[float], default_payrate: Optional[float]) -> float:
+    # Salaried: use roster PayRate as period total
     if str(pay_type).upper().startswith("S"):
         return float(_num(default_payrate) or 0.0)
     r = _num(rate) or _num(default_payrate) or 0.0
-    # If you want weighted totals by OT/DT multipliers, adjust here (e.g., 1.5x, 2x).
-    return float((reg + ot + dt) * r)
+    # Hourly: apply common multipliers
+    return float((reg * r) + (ot * 1.5 * r) + (dt * 2.0 * r))
 
 def _scan_headers(ws: Worksheet) -> Dict[str,int]:
     labels: List[Tuple[int,str]] = []
@@ -213,12 +213,14 @@ def _scan_headers(ws: Worksheet) -> Dict[str,int]:
         "Type": loc("type","pay type"),
         "Pay Rate": loc("pay rate","rate"),
         "Dept": loc("dept","department"),
-        "REGULAR": loc("regular","a01"),
+        # These are the ones your template actually uses:
         "A01": loc("a01","regular"),
-        "OVERTIME": loc("overtime","a02"),
         "A02": loc("a02","overtime"),
-        "DOUBLETIME": loc("doubletime","double time","a03"),
         "A03": loc("a03","double"),
+        # Also accept explicit labels if present:
+        "REGULAR": loc("regular"),
+        "OVERTIME": loc("overtime"),
+        "DOUBLETIME": loc("doubletime","double time"),
         "Totals": loc("totals","total"),
         "Comments": loc("comments","notes"),
     }
@@ -281,36 +283,34 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
 
     cmap = _scan_headers(ws)
 
-    def write_if(col_key: str, row_idx: int, val):
+    def write(col_key: str, row_idx: int, val):
         c = cmap.get(col_key)
         if c: ws.cell(row=row_idx, column=c, value=val)
 
     row = DATA_START_1BASED
     for r in rows:
-        write_if("EmpID", row, r["EmpID"])
-        write_if("SSN", row, r["SSN"])
-        write_if("Employee Name", row, r["Employee Name"])
-        write_if("Status", row, r["Status"])
-        write_if("Type", row, r["Type"])
-        write_if("Pay Rate", row, r["Pay Rate"])
-        write_if("Dept", row, r["Dept"])
+        write("EmpID", row, r["EmpID"])
+        write("SSN", row, r["SSN"])
+        write("Employee Name", row, r["Employee Name"])
+        write("Status", row, r["Status"])
+        write("Type", row, r["Type"])
+        write("Pay Rate", row, r["Pay Rate"])
+        write("Dept", row, r["Dept"])
 
-        # REG → both REGULAR and A01 if either exists
-        reg_cols = [k for k in ("REGULAR","A01") if cmap.get(k)]
-        if reg_cols:
-            for k in reg_cols: write_if(k, row, r["REGULAR"])
+        # Explicit A01/A02/A03 mapping first (your template), then label fallbacks:
+        wrote_reg = False
+        if cmap.get("A01"): write("A01", row, r["REGULAR"]); wrote_reg = True
+        if not wrote_reg and cmap.get("REGULAR"): write("REGULAR", row, r["REGULAR"])
 
-        # OT → both OVERTIME and A02
-        ot_cols = [k for k in ("OVERTIME","A02") if cmap.get(k)]
-        if ot_cols:
-            for k in ot_cols: write_if(k, row, r["OVERTIME"])
+        wrote_ot = False
+        if cmap.get("A02"): write("A02", row, r["OVERTIME"]); wrote_ot = True
+        if not wrote_ot and cmap.get("OVERTIME"): write("OVERTIME", row, r["OVERTIME"])
 
-        # DT → both DOUBLETIME and A03
-        dt_cols = [k for k in ("DOUBLETIME","A03") if cmap.get(k)]
-        if dt_cols:
-            for k in dt_cols: write_if(k, row, r["DOUBLETIME"])
+        wrote_dt = False
+        if cmap.get("A03"): write("A03", row, r["DOUBLETIME"]); wrote_dt = True
+        if not wrote_dt and cmap.get("DOUBLETIME"): write("DOUBLETIME", row, r["DOUBLETIME"])
 
-        write_if("Totals", row, r["Totals"])
+        write("Totals", row, r["Totals"])
         row += 1
 
     bio = io.BytesIO()
