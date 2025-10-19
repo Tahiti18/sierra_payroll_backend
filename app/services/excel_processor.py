@@ -1,9 +1,15 @@
 # app/services/excel_processor.py
-# Sierra → WBS translator with explicit A01/A02/A03 mapping and CA daily OT/DT.
+# Sierra → WBS translator (FULL FILE)
+# - Reads Sierra daily logs (Days, Job#, Name, Start, Lnch St., Lnch Fnsh, Finish, Hours, Rate, Total, Job Detail)
+# - Splits hours into REG (≤8/day), OT (8–12/day), DT (>12/day) + overlays WEEKLY >40 into OT
+# - Roster is OPTIONAL (conversion never crashes if roster.xlsx is missing)
+# - Writes to WBS template by POSITION (relative to “Pay Rate”), NOT by header text
+# - Totals column is written as a VALUE and a FORMULA (=reg*rate + 1.5*ot*rate + 2*dt*rate)
 
 from __future__ import annotations
 
-import io, re
+import io
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
@@ -11,6 +17,7 @@ from typing import Dict, Optional, Tuple, List
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.utils import get_column_letter
 
 # ---------- Paths ----------
 HERE = Path(__file__).resolve().parent
@@ -20,49 +27,54 @@ REPO_ROOT = PROJECT_ROOT.parent
 WBS_TEMPLATE_PATH = REPO_ROOT / "wbs_template.xlsx"
 ROSTER_PATH       = REPO_ROOT / "roster.xlsx"
 
-# ---------- Helpers ----------
+# ---------- Small helpers ----------
 def _num(s) -> Optional[float]:
     if s is None:
         return None
     if isinstance(s, (int, float)):
-        try: return float(s)
-        except: return None
-    ss = str(s).strip()
-    if not ss: return None
-    ss = ss.replace("$", "").replace(",", "")
+        try:
+            return float(s)
+        except Exception:
+            return None
+    ss = str(s).strip().replace("$", "").replace(",", "")
     m = re.search(r"-?\d+(\.\d+)?", ss)
-    if not m: return None
-    try: return float(m.group(0))
-    except: return None
+    return float(m.group(0)) if m else None
 
 def _safe_int(x) -> Optional[int]:
     try:
-        if pd.isna(x): return None
-    except: pass
-    try: return int(float(str(x).replace(",", "").strip()))
-    except: return None
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    try:
+        return int(float(str(x).replace(",", "").strip()))
+    except Exception:
+        return None
 
 def _normalize_name_for_join(name: str) -> Tuple[str, str]:
-    if not isinstance(name, str): return ("","")
+    if not isinstance(name, str):
+        return ("", "")
     s = " ".join(name.replace(",", " ").split()).strip()
-    if not s: return ("","")
+    if not s:
+        return ("", "")
     parts = s.split(" ")
     if "," in name:
         last, rest = [x.strip() for x in name.split(",", 1)]
         first = rest.split(" ")[0] if rest else ""
     else:
         first, last = parts[0], parts[-1]
-    last_norm  = "".join(ch for ch in last.lower()  if ch.isalpha())
-    first_norm = "".join(ch for ch in first.lower() if ch.isalpha())
-    return last_norm, first_norm
+    ln = "".join(ch for ch in last.lower() if ch.isalpha())
+    fn = "".join(ch for ch in first.lower() if ch.isalpha())
+    return ln, fn
 
 def _best_join(left_df: pd.DataFrame, right_df: pd.DataFrame,
                left_name_col: str, right_name_col: str) -> pd.DataFrame:
-    L = left_df.copy(); R = right_df.copy()
-    L[["__ln","__fn"]] = L[left_name_col].apply(lambda s: pd.Series(_normalize_name_for_join(str(s))))
-    R[["__ln","__fn"]] = R[right_name_col].apply(lambda s: pd.Series(_normalize_name_for_join(str(s))))
-    M = pd.merge(L, R, on=["__ln","__fn"], how="left", suffixes=("", "_roster"))
-    return M.drop(columns=["__ln","__fn"])
+    L = left_df.copy()
+    R = right_df.copy()
+    L[["__ln", "__fn"]] = L[left_name_col].apply(lambda s: pd.Series(_normalize_name_for_join(str(s))))
+    R[["__ln", "__fn"]] = R[right_name_col].apply(lambda s: pd.Series(_normalize_name_for_join(str(s))))
+    M = pd.merge(L, R, on=["__ln", "__fn"], how="left", suffixes=("", "_roster"))
+    return M.drop(columns=["__ln", "__fn"])
 
 # ---------- Sierra detection ----------
 @dataclass
@@ -84,10 +96,10 @@ def _detect_sierra_layout(df: pd.DataFrame) -> Optional[SierraLayout]:
             return SierraLayout(r, name_idx, hours_idx, rate_idx, days_idx)
     return None
 
-# ---------- Read + aggregate with daily OT/DT ----------
+# ---------- Read + aggregate with daily OT/DT + weekly overlay ----------
 def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
     """
-    Return DF with: Name, Reg_sum, OT_sum, DT_sum, Rate_last
+    Returns DF columns: Name, Reg_sum, OT_sum, DT_sum, Rate_last
     """
     bio = io.BytesIO(xlsx_bytes)
     df0 = pd.read_excel(bio, sheet_name=0, header=None)
@@ -111,73 +123,104 @@ def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
         days_name = df.columns[layout.days_idx]
         df = df.rename(columns={days_name: "Days"})
 
-    # Clean + numeric
+    # Clean
     df["Name"] = df["Name"].astype(str).str.strip()
     df = df[df["Name"] != ""].copy()
     df["Hours_num"] = df["Hours"].apply(_num)
     df = df[df["Hours_num"].notnull()].copy()
     df["Rate_num"] = df["Rate"].apply(_num) if "Rate" in df.columns else None
-
-    # Normalize date (Days) if present
     if "Days" in df.columns:
         df["DayKey"] = pd.to_datetime(df["Days"], errors="coerce").dt.date
     else:
         df["DayKey"] = pd.NaT
 
-    # Per-employee, per-day totals
     per_day = (df.groupby(["Name", "DayKey"], dropna=False)
                  .agg(DayHours=("Hours_num", "sum"),
                       Rate_last=("Rate_num", "last"))
                  .reset_index())
+    per_day = per_day[per_day["Name"].notna() & (per_day["Name"].astype(str).str.strip() != "")]
 
-    # Drop the bogus NaN-name bucket if it exists
-    per_day = per_day[per_day["Name"].notna() & (per_day["Name"].astype(str).str.strip() != "")].copy()
-
-    # Daily split (CA)
-    def split_daily(h: float) -> Tuple[float,float,float]:
-        if h is None: return (0.0,0.0,0.0)
+    def split_daily(h: float) -> Tuple[float, float, float]:
+        if h is None:
+            return (0.0, 0.0, 0.0)
         reg = min(h, 8.0)
         ot  = min(max(h - 8.0, 0.0), 4.0)
         dt  = max(h - 12.0, 0.0)
         return (reg, ot, dt)
 
-    per_day[["Reg","OT","DT"]] = per_day["DayHours"].apply(lambda h: pd.Series(split_daily(h)))
+    per_day[["Reg", "OT", "DT"]] = per_day["DayHours"].apply(lambda h: pd.Series(split_daily(h)))
 
-    # Aggregate back to per-employee
-    agg = (per_day.groupby("Name", dropna=False)
-                 .agg(Reg_sum=("Reg","sum"),
-                      OT_sum=("OT","sum"),
-                      DT_sum=("DT","sum"),
-                      Rate_last=("Rate_last","last"))
-                 .reset_index())
+    # Aggregate daily split
+    per_emp = (per_day.groupby("Name", dropna=False)
+                        .agg(Reg_sum=("Reg", "sum"),
+                             OT_sum=("OT", "sum"),
+                             DT_sum=("DT", "sum"),
+                             Rate_last=("Rate_last", "last"))
+                        .reset_index())
 
-    # Final cleanup: remove any NaN/blank name row
-    agg = agg[agg["Name"].notna() & (agg["Name"].astype(str).str.strip() != "")].copy()
+    # Weekly >40 overlay → push any hours above 40 from REG into OT
+    def weekly_adjust(row):
+        total = float(row["Reg_sum"] + row["OT_sum"] + row["DT_sum"])
+        if total > 40.0:
+            extra = total - 40.0
+            pull = min(extra, row["Reg_sum"])
+            row["Reg_sum"] -= pull
+            row["OT_sum"]  += pull
+            extra -= pull
+            if extra > 0:
+                row["OT_sum"] += extra
+        return row
+
+    per_emp = per_emp.apply(weekly_adjust, axis=1)
+    agg = per_emp[per_emp["Name"].notna() & (per_emp["Name"].astype(str).str.strip() != "")]
     return agg
 
-# ---------- Roster ----------
+# ---------- Roster (OPTIONAL, never crash) ----------
 def _load_roster() -> pd.DataFrame:
-    if not ROSTER_PATH.exists():
-        raise FileNotFoundError(f"Roster not found at {ROSTER_PATH}")
-    roster = pd.read_excel(ROSTER_PATH, sheet_name="Roster")
+    """
+    Try to load roster.xlsx; if it's missing, return an empty roster so conversion
+    proceeds using Sierra names/rates only.
+    Expected: sheet 'Roster' with columns:
+      EmpID, SSN, Employee Name, Status, Type, PayRate, Dept
+    """
+    expected_cols = ["EmpID", "SSN", "Employee Name", "Status", "Type", "PayRate", "Dept"]
+    candidates = [
+        ROSTER_PATH,
+        REPO_ROOT / "roster.xlsx",
+        PROJECT_ROOT / "roster.xlsx",
+        HERE / "roster.xlsx",
+        Path("/roster.xlsx"),
+    ]
+    path = next((p for p in candidates if p.exists()), None)
+
+    if path is None:
+        empty = pd.DataFrame(columns=expected_cols)
+        empty["EmpID_clean"] = pd.Series(dtype="Int64")
+        empty["SSN_clean"]   = pd.Series(dtype="Int64")
+        empty["EmployeeNameRoster"] = pd.Series(dtype="string")
+        return empty
+
+    roster = pd.read_excel(path, sheet_name="Roster")
     roster.columns = [str(c).strip() for c in roster.columns]
 
-    expected = {"EmpID","SSN","Employee Name","Status","Type","PayRate","Dept"}
-    missing = expected - set(roster.columns)
+    missing = set(expected_cols) - set(roster.columns)
     if missing:
-        raise ValueError(f"Roster missing columns: {missing}")
+        raise ValueError(f"Roster found at {path} but missing columns: {missing}")
 
     roster["EmpID_clean"] = roster["EmpID"].apply(_safe_int)
     roster["SSN_clean"]   = roster["SSN"].apply(_safe_int)
     roster["EmployeeNameRoster"] = roster["Employee Name"].astype(str)
     return roster
 
-# ---------- WBS mapping ----------
+# ---------- WBS assembly ----------
 def _pad_empid(empid: Optional[int]) -> Optional[str]:
-    if empid is None: return None
+    if empid is None:
+        return None
     s = str(empid).strip()
-    try: s = str(int(float(s)))
-    except: return None
+    try:
+        s = str(int(float(s)))
+    except Exception:
+        return None
     return s.zfill(10)
 
 def _calc_totals(pay_type: str, reg: float, ot: float, dt: float,
@@ -186,65 +229,32 @@ def _calc_totals(pay_type: str, reg: float, ot: float, dt: float,
     if str(pay_type).upper().startswith("S"):
         return float(_num(default_payrate) or 0.0)
     r = _num(rate) or _num(default_payrate) or 0.0
-    # Hourly: apply common multipliers
     return float((reg * r) + (ot * 1.5 * r) + (dt * 2.0 * r))
 
-def _scan_headers(ws: Worksheet) -> Dict[str,int]:
-    labels: List[Tuple[int,str]] = []
-    for row_idx in range(6, 11):
-        for cell in ws[row_idx]:
-            label = str(cell.value or "").strip()
-            if label:
-                labels.append((cell.column, label))
-
-    def loc(*names: str) -> Optional[int]:
-        keys = [n.lower() for n in names]
-        for col_idx, label in labels:
-            L = label.lower().strip()
-            if any(L == k or k in L for k in keys):
-                return col_idx
-        return None
-
-    return {
-        "EmpID": loc("# e:26","employee id","emp id","empid"),
-        "SSN": loc("ssn"),
-        "Employee Name": loc("employee name","name"),
-        "Status": loc("status"),
-        "Type": loc("type","pay type"),
-        "Pay Rate": loc("pay rate","rate"),
-        "Dept": loc("dept","department"),
-        # These are the ones your template actually uses:
-        "A01": loc("a01","regular"),
-        "A02": loc("a02","overtime"),
-        "A03": loc("a03","double"),
-        # Also accept explicit labels if present:
-        "REGULAR": loc("regular"),
-        "OVERTIME": loc("overtime"),
-        "DOUBLETIME": loc("doubletime","double time"),
-        "Totals": loc("totals","total"),
-        "Comments": loc("comments","notes"),
-    }
-
-def _build_rows(agg: pd.DataFrame, roster: pd.DataFrame) -> List[Dict[str,object]]:
+def _build_rows(agg: pd.DataFrame, roster: pd.DataFrame) -> List[Dict[str, object]]:
     joined = _best_join(agg, roster, "Name", "EmployeeNameRoster")
-    out: List[Dict[str,object]] = []
+    out: List[Dict[str, object]] = []
 
     for _, r in joined.iterrows():
         name_src = str(r["Name"]).strip()
-        reg = float(r.get("Reg_sum",0.0) or 0.0)
-        ot  = float(r.get("OT_sum",0.0) or 0.0)
-        dt  = float(r.get("DT_sum",0.0) or 0.0)
+        reg = float(r.get("Reg_sum", 0.0) or 0.0)
+        ot  = float(r.get("OT_sum", 0.0) or 0.0)
+        dt  = float(r.get("DT_sum", 0.0) or 0.0)
         rate_si = r.get("Rate_last")
 
-        empid = r.get("EmpID_clean"); ssn = r.get("SSN_clean")
+        empid = r.get("EmpID_clean")
+        ssn   = r.get("SSN_clean")
         name_roster = r.get("EmployeeNameRoster")
-        status = r.get("Status","A"); ptype = r.get("Type","H")
-        payrate_roster = r.get("PayRate"); dept = r.get("Dept")
+        status = r.get("Status", "A")
+        ptype  = r.get("Type", "H")
+        payrate_roster = r.get("PayRate")
+        dept = r.get("Dept")
 
-        name_final = str(name_roster).strip() if pd.notna(name_roster) and str(name_roster).strip() else name_src
+        name_final = (str(name_roster).strip()
+                      if pd.notna(name_roster) and str(name_roster).strip()
+                      else name_src)
         rate_final = _num(payrate_roster) if _num(payrate_roster) is not None else _num(rate_si)
-
-        totals = _calc_totals(str(ptype or "H"), reg, ot, dt, rate_final, payrate_roster)
+        totals_val = _calc_totals(str(ptype or "H"), reg, ot, dt, rate_final, payrate_roster)
 
         out.append({
             "EmpID": _pad_empid(empid),
@@ -257,61 +267,96 @@ def _build_rows(agg: pd.DataFrame, roster: pd.DataFrame) -> List[Dict[str,object
             "REGULAR": reg,
             "OVERTIME": ot,
             "DOUBLETIME": dt,
-            "Totals": totals,
+            "Totals": totals_val,
         })
     return out
 
-# ---------- Main ----------
+# ---------- Main: Sierra Excel (bytes) → WBS Excel (bytes) ----------
 def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
+    if not WBS_TEMPLATE_PATH.exists():
+        raise FileNotFoundError(f"WBS template not found at {WBS_TEMPLATE_PATH}")
+
     agg = _read_sierra_records(xlsx_bytes)
     roster = _load_roster()
     rows = _build_rows(agg, roster)
 
-    if not WBS_TEMPLATE_PATH.exists():
-        raise FileNotFoundError(f"WBS template not found at {WBS_TEMPLATE_PATH}")
-
     wb = load_workbook(WBS_TEMPLATE_PATH)
     ws: Worksheet = wb["WEEKLY"]
 
-    HEADER_ROW_1BASED = 8
-    DATA_START_1BASED = 9
+    HEADER_ROW_1BASED = 8   # labels
+    DATA_START_1BASED = 9   # first data row
 
-    # clear old
+    # Clear existing data
     max_row = ws.max_row
     if max_row >= DATA_START_1BASED:
         ws.delete_rows(DATA_START_1BASED, max_row - DATA_START_1BASED + 1)
 
-    cmap = _scan_headers(ws)
+    # Build an index of header labels (lowercased) by position
+    header_cells = [str(c.value or "").strip().lower() for c in ws[HEADER_ROW_1BASED]]
 
-    def write(col_key: str, row_idx: int, val):
-        c = cmap.get(col_key)
-        if c: ws.cell(row=row_idx, column=c, value=val)
+    def col_of_exact(label: str) -> Optional[int]:
+        label = label.strip().lower()
+        for i, txt in enumerate(header_cells, start=1):
+            if txt == label:
+                return i
+        return None
 
-    row = DATA_START_1BASED
-    for r in rows:
-        write("EmpID", row, r["EmpID"])
-        write("SSN", row, r["SSN"])
-        write("Employee Name", row, r["Employee Name"])
-        write("Status", row, r["Status"])
-        write("Type", row, r["Type"])
-        write("Pay Rate", row, r["Pay Rate"])
-        write("Dept", row, r["Dept"])
+    # Locate Pay Rate (by exact label first, else by contains)
+    payrate_col = col_of_exact("pay rate")
+    if not payrate_col:
+        for i, txt in enumerate(header_cells, start=1):
+            if "rate" in txt:
+                payrate_col = i
+                break
+    if not payrate_col:
+        # fall back to a sensible default (often column G = 7)
+        payrate_col = 7
 
-        # Explicit A01/A02/A03 mapping first (your template), then label fallbacks:
-        wrote_reg = False
-        if cmap.get("A01"): write("A01", row, r["REGULAR"]); wrote_reg = True
-        if not wrote_reg and cmap.get("REGULAR"): write("REGULAR", row, r["REGULAR"])
+    # Position-based numeric buckets immediately after Pay Rate
+    reg_col = payrate_col + 1  # A01 (REG)
+    ot_col  = reg_col + 1      # A02 (OT)
+    dt_col  = ot_col + 1       # A03 (DT)
 
-        wrote_ot = False
-        if cmap.get("A02"): write("A02", row, r["OVERTIME"]); wrote_ot = True
-        if not wrote_ot and cmap.get("OVERTIME"): write("OVERTIME", row, r["OVERTIME"])
+    # Totals: choose the right-most labeled column (your pink “Totals”)
+    right_most_labeled = max([i for i, txt in enumerate(header_cells, start=1) if txt], default=dt_col + 1)
+    totals_col = right_most_labeled
 
-        wrote_dt = False
-        if cmap.get("A03"): write("A03", row, r["DOUBLETIME"]); wrote_dt = True
-        if not wrote_dt and cmap.get("DOUBLETIME"): write("DOUBLETIME", row, r["DOUBLETIME"])
+    # Optional: locate common ID/name columns by label (best-effort)
+    empid_col = col_of_exact("# e:26") or col_of_exact("employee id") or col_of_exact("empid")
+    ssn_col   = col_of_exact("ssn")
+    name_col  = col_of_exact("employee name") or col_of_exact("name")
+    status_col = col_of_exact("status")
+    type_col   = col_of_exact("type")
+    dept_col   = col_of_exact("dept") or col_of_exact("department")
 
-        write("Totals", row, r["Totals"])
-        row += 1
+    # Write rows
+    r = DATA_START_1BASED
+    for row in rows:
+        # IDs/names (best-effort)
+        if empid_col: ws.cell(row=r, column=empid_col, value=row["EmpID"])
+        if ssn_col:   ws.cell(row=r, column=ssn_col,   value=row["SSN"])
+        if name_col:  ws.cell(row=r, column=name_col,  value=row["Employee Name"])
+        if status_col: ws.cell(row=r, column=status_col, value=row["Status"])
+        if type_col:   ws.cell(row=r, column=type_col,   value=row["Type"])
+        if dept_col:   ws.cell(row=r, column=dept_col,   value=row["Dept"])
+
+        # Pay rate and hour buckets (by position)
+        ws.cell(row=r, column=payrate_col, value=row["Pay Rate"])
+        ws.cell(row=r, column=reg_col,     value=round(float(row["REGULAR"]), 3))
+        ws.cell(row=r, column=ot_col,      value=round(float(row["OVERTIME"]), 3))
+        ws.cell(row=r, column=dt_col,      value=round(float(row["DOUBLETIME"]), 3))
+
+        # Totals: write value AND a formula so Excel recalculates with your formatting
+        total_val = float(row["Totals"] or 0.0)
+        ws.cell(row=r, column=totals_col, value=total_val)
+
+        rate_ref = f"{get_column_letter(payrate_col)}{r}"
+        reg_ref  = f"{get_column_letter(reg_col)}{r}"
+        ot_ref   = f"{get_column_letter(ot_col)}{r}"
+        dt_ref   = f"{get_column_letter(dt_col)}{r}"
+        ws.cell(row=r, column=totals_col).value = f"=({reg_ref}*{rate_ref})+({ot_ref}*1.5*{rate_ref})+({dt_ref}*2*{rate_ref})"
+
+        r += 1
 
     bio = io.BytesIO()
     wb.save(bio)
