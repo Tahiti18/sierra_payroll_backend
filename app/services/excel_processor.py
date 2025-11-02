@@ -1,13 +1,16 @@
 # app/services/excel_processor.py
-# Sierra → WBS translator (FULL FILE, COLOR-TARGETED TOTALS, FORCED A01/A02/A03)
+# Sierra → WBS translator (FULL FILE, HARD-WIRED WRITES)
 # - Reads Sierra daily logs (Days, Job#, Name, Start, Lnch St., Lnch Fnsh, Finish, Hours, Rate, Total, Job Detail)
 # - Splits hours into REG (≤8/day), OT (8–12/day), DT (>12/day) + overlays WEEKLY >40 into OT
 # - Roster is OPTIONAL (conversion never crashes if roster.xlsx is missing)
 # - Writes A01/A02/A03 regardless of header quirks:
-#     * If headers "A01"/"A02"/"A03" found → write there
-#     * Else → write by POSITION immediately right of "Pay Rate" (REG, OT, DT)
-# - Totals (pink) targeted by HEADER CELL COLOR (pink/red); if not found, we also write to several safe fallbacks.
-# - Adds DEBUG sheet with header labels, header RGB fills, chosen columns, and first 25 computed rows.
+#     1) If headers "A01"/"A02"/"A03" are found → write there.
+#     2) Else, write by POSITION immediately to the right of "Pay Rate" (REG, OT, DT).
+# - Totals is written (VALUE + FORMULA) to MULTIPLE destinations so the pink column shows up:
+#     • any column whose header contains "total"
+#     • the right-most labeled header column
+#     • the very last header column in the row (far right / pink)
+# - Adds a DEBUG sheet with header row text, chosen columns, and first 25 computed rows.
 
 from __future__ import annotations
 
@@ -28,10 +31,6 @@ REPO_ROOT = PROJECT_ROOT.parent
 
 WBS_TEMPLATE_PATH = REPO_ROOT / "wbs_template.xlsx"
 ROSTER_PATH       = REPO_ROOT / "roster.xlsx"
-
-# If you KNOW the exact header row number in your template, set it here (1-based).
-# Otherwise we auto-detect between rows 6–12.
-FORCE_HEADER_ROW_1BASED: Optional[int] = None
 
 # ---------- helpers ----------
 def _num(s) -> Optional[float]:
@@ -250,31 +249,6 @@ def _build_rows(agg: pd.DataFrame, roster: pd.DataFrame) -> List[Dict[str,object
         })
     return out
 
-# ---------- color utils ----------
-def _cell_rgb(cell) -> Optional[str]:
-    """Return RGB hex like 'FF00AA' or None."""
-    try:
-        fill = cell.fill
-        if not fill: return None
-        fg = fill.fgColor
-        if fg is None: return None
-        if fg.type == "rgb" and fg.rgb:
-            v = fg.rgb
-            if isinstance(v, str) and len(v) in (6,8):
-                return v[-6:].upper()
-        if fg.type == "indexed" and fg.indexed is not None:
-            # Not reliable across themes, skip
-            return None
-    except Exception:
-        return None
-    return None
-
-def _is_pinkish(rgb: Optional[str]) -> bool:
-    """Heuristic: pink/red — high R, medium/low G, medium B."""
-    if not rgb or len(rgb) != 6: return False
-    r = int(rgb[0:2],16); g = int(rgb[2:4],16); b = int(rgb[4:6],16)
-    return (r > 180) and (g < 170) and (b > 120)
-
 # ---------- main: Sierra (bytes) → WBS (bytes) ----------
 def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     if not WBS_TEMPLATE_PATH.exists():
@@ -284,23 +258,21 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     roster = _load_roster()
     rows = _build_rows(agg, roster)
 
+    # Open template; prefer "WEEKLY" else any sheet containing 'week'
     wb = load_workbook(WBS_TEMPLATE_PATH)
     ws: Worksheet = wb["WEEKLY"] if "WEEKLY" in wb.sheetnames else next((wb[s] for s in wb.sheetnames if "week" in s.lower()), wb.active)
 
-    # Header row detection
-    if FORCE_HEADER_ROW_1BASED:
-        header_row = FORCE_HEADER_ROW_1BASED
-    else:
-        header_row = None
-        header_score = -1
-        for r in range(6, 13):  # scan 6..12
-            vals = [str(c.value or "").strip() for c in ws[r]]
-            score = sum(1 for v in vals if v)
-            if score > header_score:
-                header_score = score
-                header_row = r
-        if header_row is None:
-            header_row = 8
+    # Try to locate the header row: scan rows 6–12; choose the row with the most labels
+    header_row = None
+    header_score = -1
+    for r in range(6, 13):
+        vals = [str(c.value or "").strip() for c in ws[r]]
+        score = sum(1 for v in vals if v)  # how many labels present
+        if score > header_score:
+            header_score = score
+            header_row = r
+    if header_row is None:
+        header_row = 8  # safe default
 
     DATA_START = header_row + 1
 
@@ -308,10 +280,9 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     if ws.max_row >= DATA_START:
         ws.delete_rows(DATA_START, ws.max_row - DATA_START + 1)
 
-    # Header arrays and colors
+    # Header arrays
     hdr_raw   = [str(c.value or "").strip() for c in ws[header_row]]
     hdr_lower = [h.lower() for h in hdr_raw]
-    hdr_rgb   = [_cell_rgb(c) for c in ws[header_row]]
     last_header_col = len(hdr_raw) if hdr_raw else 20
 
     def col_eq(label: str) -> Optional[int]:
@@ -328,9 +299,10 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
                 return i
         return None
 
-    # Identify Pay Rate
+    # Identify Pay Rate, then positional A01/A02/A03
     payrate_col = col_eq("pay rate") or col_has("rate")
     if not payrate_col:
+        # try common positions (many templates have pay rate 6–8)
         for guess in (6,7,8,9,10):
             if guess <= last_header_col:
                 payrate_col = guess
@@ -338,34 +310,32 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     if not payrate_col:
         payrate_col = 7
 
-    # A01/A02/A03 targets (exact first, else by position after Pay Rate)
+    # Try exact labels for A01/A02/A03 first
     a01_col = col_eq("a01") or col_eq("regular")
-    a02_col = col_eq("a02") or col_eq("overtime") or col_has("ot")
+    a02_col = col_eq("a02") or col_eq("overtime")
     a03_col = col_eq("a03") or col_has("double")
+
+    # Fallback to positions to the right of pay rate
     if not a01_col: a01_col = payrate_col + 1
     if not a02_col: a02_col = a01_col + 1
     if not a03_col: a03_col = a02_col + 1
 
-    # Pink totals target by COLOR (right-most pinkish cell wins)
-    pink_cols = [i for i, rgb in enumerate(hdr_rgb, start=1) if _is_pinkish(rgb)]
-    totals_color_col = max(pink_cols) if pink_cols else None
-
-    # Totals fallbacks (if no pink found)
-    totals_fallbacks: List[int] = []
-    # any header containing "total"
+    # Totals candidates:
+    totals_candidates: List[int] = []
+    # 1) any header containing "total"
     for i, txt in enumerate(hdr_lower, start=1):
-        if "total" in txt and i not in totals_fallbacks:
-            totals_fallbacks.append(i)
-    # right-most labeled header
+        if "total" in txt and i not in totals_candidates:
+            totals_candidates.append(i)
+    # 2) right-most labeled header
     right_most_labeled = max([i for i, t in enumerate(hdr_raw, start=1) if str(t).strip()], default=None)
-    if right_most_labeled and right_most_labeled not in totals_fallbacks:
-        totals_fallbacks.append(right_most_labeled)
-    # absolute last header column
-    if last_header_col not in totals_fallbacks:
-        totals_fallbacks.append(last_header_col)
-    # dt+1 safety
-    if (a03_col + 1) not in totals_fallbacks:
-        totals_fallbacks.append(a03_col + 1)
+    if right_most_labeled and right_most_labeled not in totals_candidates:
+        totals_candidates.append(right_most_labeled)
+    # 3) absolute last header column (far-right/pink)
+    if last_header_col not in totals_candidates:
+        totals_candidates.append(last_header_col)
+    # 4) dt+1 as a safety
+    if (a03_col + 1) not in totals_candidates:
+        totals_candidates.append(a03_col + 1)
 
     # Optional IDs
     empid_col  = col_eq("# e:26") or col_has("emp id") or col_has("empid")
@@ -378,7 +348,7 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     # Write all rows
     r = DATA_START
     for row in rows:
-        # Identity
+        # Identity fields (best effort)
         if empid_col:  ws.cell(row=r, column=empid_col,  value=row["EmpID"])
         if ssn_col:    ws.cell(row=r, column=ssn_col,    value=row["SSN"])
         if name_col:   ws.cell(row=r, column=name_col,   value=row["Employee Name"])
@@ -386,14 +356,14 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
         if type_col:   ws.cell(row=r, column=type_col,   value=row["Type"])
         if dept_col:   ws.cell(row=r, column=dept_col,   value=row["Dept"])
 
-        # Rates + buckets — FORCE WRITE
+        # Rates + buckets (FORCED)
         rate_val = row["Pay Rate"] if row["Pay Rate"] != "" else None
         ws.cell(row=r, column=payrate_col, value=rate_val)
         ws.cell(row=r, column=a01_col, value=round(float(row["REGULAR"]), 3))
         ws.cell(row=r, column=a02_col, value=round(float(row["OVERTIME"]), 3))
         ws.cell(row=r, column=a03_col, value=round(float(row["DOUBLETIME"]), 3))
 
-        # Totals numeric + formula to COLOR column (if found) and ALL fallbacks
+        # Totals: write to ALL candidates (value + formula), so one WILL be your pink column
         total_val = float(row["Totals"] or 0.0)
         rate_ref = f"{get_column_letter(payrate_col)}{r}"
         reg_ref  = f"{get_column_letter(a01_col)}{r}"
@@ -401,12 +371,8 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
         dt_ref   = f"{get_column_letter(a03_col)}{r}"
         formula = f"=({reg_ref}*{rate_ref})+({ot_ref}*1.5*{rate_ref})+({dt_ref}*2*{rate_ref})"
 
-        target_cols = []
-        if totals_color_col:
-            target_cols.append(totals_color_col)
-        target_cols.extend([c for c in totals_fallbacks if c not in target_cols])
-
-        for tcol in target_cols:
+        for tcol in totals_candidates:
+            # don't exceed worksheet width
             if tcol is None or tcol < 1:
                 continue
             ws.cell(row=r, column=tcol, value=total_val)
@@ -414,21 +380,19 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
 
         r += 1
 
-    # DEBUG sheet: headers, RGBs, chosen columns, sample outputs
+    # DEBUG sheet: show headers, column picks, and first 25 rows
     if "DEBUG" in wb.sheetnames:
         wb.remove(wb["DEBUG"])
     dbg = wb.create_sheet("DEBUG")
     dbg.append([f"Header row used: {header_row}"])
-    dbg.append(["Header Text →"] + hdr_raw)
-    dbg.append(["Header RGB  →"] + [rgb or "" for rgb in hdr_rgb])
+    dbg.append(hdr_raw)
     dbg.append([])
     dbg.append(["Chosen columns →",
                 "Pay Rate", payrate_col,
                 "A01", a01_col,
                 "A02", a02_col,
                 "A03", a03_col,
-                "TotalsColor", totals_color_col,
-                "TotalsFallbacks", ", ".join(str(c) for c in totals_fallbacks)])
+                "Totals candidates", ", ".join(str(c) for c in totals_candidates)])
     dbg.append([])
     dbg.append(["First 25 rows (Name, Rate, REG, OT, DT, TotalVal)"])
     for row in rows[:25]:
