@@ -1,12 +1,11 @@
 # app/services/excel_processor.py
-# Sierra → WBS translator (FULL FILE, HARD-WIRED WRITES)
-# - Reads Sierra daily logs (Days, Job#, Name, Start, Lnch St., Lnch Fnsh, Finish, Hours, Rate, Total, Job Detail)
-# - Splits hours into REG (≤8/day), OT (8–12/day), DT (>12/day), then overlays WEEKLY >40 into OT
-# - Roster is OPTIONAL (conversion never crashes if roster.xlsx is missing)
-# - Writes REGULAR/OVERTIME/DOUBLETIME when present; only falls back to A01/A02/A03 if needed
-# - Totals is written as a FORMULA to multiple candidate columns
-# - Adds a DEBUG sheet summarizing header picks and the first 25 computed rows
-
+# Sierra → WBS translator (FULL FILE, ORDER + CLEAN ZEROS + HEADER MATCH)
+# - Daily split: ≤8 REG, next 4 OT, rest DT; then weekly overlay: move >40 from REG to OT
+# - Prioritizes writing to REGULAR/OVERTIME/DOUBLETIME; A01/A02/A03 only if those are absent
+# - Totals written as a formula into multiple candidate "Totals" columns
+# - Zeros rendered as blanks for REG/OT/DT
+# - Output row order: preserve existing WBS name order from the template (fixed top block), then append the rest A–Z (by last name)
+# - Status/Type/Dept pulled from roster when available; safe defaults if missing
 from __future__ import annotations
 
 import io, re
@@ -75,6 +74,22 @@ def _best_join(left_df: pd.DataFrame, right_df: pd.DataFrame,
     M = pd.merge(L, R, on=["__ln", "__fn"], how="left", suffixes=("", "_roster"))
     return M.drop(columns=["__ln", "__fn"])
 
+def _last_name_key(full_name: str) -> Tuple[str, str]:
+    s = str(full_name or "").strip()
+    if not s:
+        return ("", "")
+    # try "Last, First" first
+    if "," in s:
+        last, rest = [x.strip() for x in s.split(",", 1)]
+        first = rest.split(" ")[0] if rest else ""
+    else:
+        parts = s.split()
+        first = parts[0]
+        last = parts[-1]
+    ln = "".join(ch for ch in last.lower() if ch.isalpha())
+    fn = "".join(ch for ch in first.lower() if ch.isalpha())
+    return (ln, fn)
+
 # ---------- Sierra detection ----------
 @dataclass
 class SierraLayout:
@@ -117,35 +132,29 @@ def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
         rate_name = df.columns[layout.rate_idx]
         if rate_name not in ("Name", "Hours"):
             df = df.rename(columns={rate_name: "Rate"})
-    # Use provided day values if available
+    # Optional day info
     if layout.days_idx is not None:
         days_name = df.columns[layout.days_idx]
         df = df.rename(columns={days_name: "Days"})
 
-    # Clean
     df["Name"] = df["Name"].astype(str).str.strip()
     df = df[df["Name"] != ""].copy()
     df["Hours_num"] = df["Hours"].apply(_num)
     df = df[df["Hours_num"].notnull()].copy()
     df["Rate_num"] = df["Rate"].apply(_num) if "Rate" in df.columns else None
 
-    # CORE CHANGE:
-    # If we do not have usable day values, treat each row as a separate "day"
-    # This prevents collapsing weekly totals into one giant "day" and preserves daily splitting.
+    # If no usable day values, treat each row as a separate day
+    have_any_day = False
     if "Days" in df.columns:
         df["DayKey"] = pd.to_datetime(df["Days"], errors="coerce").dt.date
         have_any_day = df["DayKey"].notna().any()
-    else:
-        have_any_day = False
 
     if have_any_day:
-        # Group by Name + Day to get a true per-day bucket
         per_day = (df.groupby(["Name", "DayKey"], dropna=False)
                      .agg(DayHours=("Hours_num", "sum"),
                           Rate_last=("Rate_num", "last"))
                      .reset_index())
     else:
-        # No day provided → each row is a day
         per_day = df.rename(columns={"Hours_num": "DayHours", "Rate_num": "Rate_last"})[["Name", "DayHours", "Rate_last"]].copy()
         per_day["DayKey"] = pd.NA
 
@@ -178,7 +187,7 @@ def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
             row["OT_sum"]  += pull
             extra -= pull
             if extra > 0:
-                row["OT_sum"] += extra
+                row["OT_sum"] += extra  # any remainder still increases OT
         return row
 
     per_emp = per_emp.apply(weekly_adjust, axis=1)
@@ -271,12 +280,11 @@ def _build_rows(agg: pd.DataFrame, roster: pd.DataFrame) -> List[Dict[str, objec
         })
     return out
 
-# ---------- header utilities ----------
+# ---------- header utils ----------
 def _norm_label(s: str) -> str:
     return "".join(ch for ch in str(s).lower() if ch.isalnum())
 
 def _find_columns(hdr_raw: List[str]) -> Dict[str, Optional[int]]:
-    # Build maps
     hdr_lower = [str(x or "").strip().lower() for x in hdr_raw]
     hdr_norm  = [_norm_label(x) for x in hdr_raw]
 
@@ -295,13 +303,12 @@ def _find_columns(hdr_raw: List[str]) -> Dict[str, Optional[int]]:
         return None
 
     def idx_norm_in(aliases: List[str]) -> Optional[int]:
-        alias_norm = { _norm_label(a) for a in aliases }
+        alias_norm = {_norm_label(a) for a in aliases}
         for i, n in enumerate(hdr_norm, start=1):
             if n in alias_norm:
                 return i
         return None
 
-    # Core columns
     payrate_col = (
         idx_exact("pay rate")
         or idx_contains("pay rate")
@@ -309,19 +316,16 @@ def _find_columns(hdr_raw: List[str]) -> Dict[str, Optional[int]]:
         or None
     )
 
-    # Prefer REG/OT/DT names first; then A01/A02/A03; else positional
+    # Prefer REG/OT/DT first
     reg_col = idx_norm_in(["regular", "reg"])
     ot_col  = idx_norm_in(["overtime", "ot"])
     dt_col  = idx_norm_in(["doubletime", "double time", "dt"])
+    # fallback A01/A02/A03
+    if not reg_col: reg_col = idx_norm_in(["a01"])
+    if not ot_col:  ot_col  = idx_norm_in(["a02"])
+    if not dt_col:  dt_col  = idx_norm_in(["a03"])
 
-    if not reg_col:
-        reg_col = idx_norm_in(["a01"])
-    if not ot_col:
-        ot_col  = idx_norm_in(["a02"])
-    if not dt_col:
-        dt_col  = idx_norm_in(["a03"])
-
-    # Identity / meta columns (broad matching)
+    # Identity / meta columns
     empid_col  = idx_contains("emp id") or idx_exact("empid") or idx_exact("# e:26")
     ssn_col    = idx_exact("ssn") or idx_contains("ssn")
     name_col   = idx_exact("employee name") or idx_exact("name") or idx_contains("employee")
@@ -342,7 +346,7 @@ def _find_columns(hdr_raw: List[str]) -> Dict[str, Optional[int]]:
         "dept": dept_col,
     }
 
-# ---------- main: Sierra (bytes) → WBS (bytes) ----------
+# ---------- main ----------
 def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     if not WBS_TEMPLATE_PATH.exists():
         raise FileNotFoundError(f"WBS template not found at {WBS_TEMPLATE_PATH}")
@@ -355,29 +359,36 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     wb = load_workbook(WBS_TEMPLATE_PATH)
     ws: Worksheet = wb["WEEKLY"] if "WEEKLY" in wb.sheetnames else next((wb[s] for s in wb.sheetnames if "week" in s.lower()), wb.active)
 
-    # Try to locate the header row: scan rows 6–12; choose the row with the most labels
+    # Locate header row: scan rows 6–12; choose row with most labels
     header_row = None
     header_score = -1
     for r in range(6, 13):
         vals = [str(c.value or "").strip() for c in ws[r]]
-        score = sum(1 for v in vals if v)  # how many labels present
+        score = sum(1 for v in vals if v)
         if score > header_score:
             header_score = score
             header_row = r
     if header_row is None:
-        header_row = 8  # safe default
+        header_row = 8
 
     DATA_START = header_row + 1
+
+    # ----- Capture existing order BEFORE clearing -----
+    hdr_raw = [str(c.value or "").strip() for c in ws[header_row]]
+    cols = _find_columns(hdr_raw)
+    name_col_idx = cols["name"]
+    existing_order: List[str] = []
+    if name_col_idx:
+        for rr in range(DATA_START, ws.max_row + 1):
+            val = ws.cell(row=rr, column=name_col_idx).value
+            if val and str(val).strip():
+                existing_order.append(str(val).strip())
+
+    last_header_col = len(hdr_raw) if hdr_raw else 20
 
     # Clear existing data lines
     if ws.max_row >= DATA_START:
         ws.delete_rows(DATA_START, ws.max_row - DATA_START + 1)
-
-    # Header arrays
-    hdr_raw = [str(c.value or "").strip() for c in ws[header_row]]
-    last_header_col = len(hdr_raw) if hdr_raw else 20
-
-    cols = _find_columns(hdr_raw)
 
     # Safety defaults
     payrate_col = cols["payrate"] or min(last_header_col, 7)
@@ -402,9 +413,25 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     if (cols["dt"] + 1) not in totals_candidates:
         totals_candidates.append(cols["dt"] + 1)
 
-    # Write all rows
+    # ----- Order rows: existing WBS order first, then remaining A–Z by last name -----
+    existing_index = {name: idx for idx, name in enumerate(existing_order)} if existing_order else {}
+    def sort_key(row: Dict[str, object]) -> Tuple[int, Tuple[str, str]]:
+        nm = str(row["Employee Name"] or "").strip()
+        pri = existing_index.get(nm, 10**9)  # names found in existing sheet come first by their index
+        return (pri, _last_name_key(nm))
+    rows_sorted = sorted(rows, key=sort_key)
+
+    # Helper: write blank for zero values
+    def _nz_or_blank(v: float) -> Optional[float]:
+        try:
+            f = float(v or 0.0)
+        except Exception:
+            return None
+        return None if abs(f) < 1e-9 else round(f, 3)
+
+    # Write rows
     r = DATA_START
-    for row in rows:
+    for row in rows_sorted:
         # Identity fields (best effort)
         if cols["empid"]:  ws.cell(row=r, column=cols["empid"],  value=row["EmpID"])
         if cols["ssn"]:    ws.cell(row=r, column=cols["ssn"],    value=row["SSN"])
@@ -413,28 +440,26 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
         if cols["type"]:   ws.cell(row=r, column=cols["type"],   value=row["Type"])
         if cols["dept"]:   ws.cell(row=r, column=cols["dept"],   value=row["Dept"])
 
-        # Rates + buckets (forced)
+        # Rates + buckets (write blanks for zeros)
         rate_val = row["Pay Rate"] if row["Pay Rate"] != "" else None
         ws.cell(row=r, column=payrate_col, value=rate_val)
-        ws.cell(row=r, column=cols["reg"], value=round(float(row["REGULAR"]), 3))
-        ws.cell(row=r, column=cols["ot"],  value=round(float(row["OVERTIME"]), 3))
-        ws.cell(row=r, column=cols["dt"],  value=round(float(row["DOUBLETIME"]), 3))
+        ws.cell(row=r, column=cols["reg"], value=_nz_or_blank(row["REGULAR"]))
+        ws.cell(row=r, column=cols["ot"],  value=_nz_or_blank(row["OVERTIME"]))
+        ws.cell(row=r, column=cols["dt"],  value=_nz_or_blank(row["DOUBLETIME"]))
 
-        # Totals: write formula to all candidates
+        # Totals: always write formula (pink column(s) evaluate)
         rate_ref = f"{get_column_letter(payrate_col)}{r}"
         reg_ref  = f"{get_column_letter(cols['reg'])}{r}"
         ot_ref   = f"{get_column_letter(cols['ot'])}{r}"
         dt_ref   = f"{get_column_letter(cols['dt'])}{r}"
         formula = f"=({reg_ref}*{rate_ref})+({ot_ref}*1.5*{rate_ref})+({dt_ref}*2*{rate_ref})"
-
         for tcol in totals_candidates:
-            if tcol is None or tcol < 1:
-                continue
-            ws.cell(row=r, column=tcol).value = formula
+            if tcol and tcol > 0:
+                ws.cell(row=r, column=tcol).value = formula
 
         r += 1
 
-    # DEBUG sheet: show headers, column picks, and first 25 rows
+    # DEBUG sheet: show headers, picks, and first 25 rows
     if "DEBUG" in wb.sheetnames:
         wb.remove(wb["DEBUG"])
     dbg = wb.create_sheet("DEBUG")
@@ -455,7 +480,7 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     ])
     dbg.append([])
     dbg.append(["First 25 rows (Name, Rate, REG, OT, DT, Totals calc preview)"])
-    for row in rows[:25]:
+    for row in rows_sorted[:25]:
         dbg.append([
             row["Employee Name"],
             row["Pay Rate"],
