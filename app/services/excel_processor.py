@@ -3,13 +3,8 @@
 # - Reads Sierra daily logs (Days, Job#, Name, Start, Lnch St., Lnch Fnsh, Finish, Hours, Rate, Total, Job Detail)
 # - Splits hours into REG (≤8/day), OT (8–12/day), DT (>12/day) + overlays WEEKLY >40 into OT
 # - Roster is OPTIONAL (conversion never crashes if roster.xlsx is missing)
-# - Writes A01/A02/A03 regardless of header quirks:
-#     1) If headers "A01"/"A02"/"A03" are found → write there.
-#     2) Else, write by POSITION immediately to the right of "Pay Rate" (REG, OT, DT).
-# - Totals is written (VALUE + FORMULA) to MULTIPLE destinations so the pink column shows up:
-#     • any column whose header contains "total"
-#     • the right-most labeled header column
-#     • the very last header column in the row (far right / pink)
+# - Writes REGULAR/OVERTIME/DOUBLETIME if present; falls back to A01/A02/A03 only if REG/OT/DT are absent.
+# - Totals is written (FORMULA) to MULTIPLE destinations so the pink column shows up.
 # - Adds a DEBUG sheet with header row text, chosen columns, and first 25 computed rows.
 
 from __future__ import annotations
@@ -299,10 +294,9 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
                 return i
         return None
 
-    # Identify Pay Rate, then positional A01/A02/A03
+    # Identify Pay Rate
     payrate_col = col_eq("pay rate") or col_has("rate")
     if not payrate_col:
-        # try common positions (many templates have pay rate 6–8)
         for guess in (6,7,8,9,10):
             if guess <= last_header_col:
                 payrate_col = guess
@@ -310,15 +304,25 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     if not payrate_col:
         payrate_col = 7
 
-    # Try exact labels for A01/A02/A03 first
-    a01_col = col_eq("a01") or col_eq("regular")
-    a02_col = col_eq("a02") or col_eq("overtime")
-    a03_col = col_eq("a03") or col_has("double")
+    # --------- CRITICAL CHANGE: prefer REG/OT/DT over A01/A02/A03 ----------
+    # Try explicit REGULAR/OVERTIME/DOUBLETIME first
+    reg_col = col_eq("regular")
+    ot_col  = col_eq("overtime")
+    dt_col  = col_eq("doubletime") or col_has("double time")
 
-    # Fallback to positions to the right of pay rate
-    if not a01_col: a01_col = payrate_col + 1
-    if not a02_col: a02_col = a01_col + 1
-    if not a03_col: a03_col = a02_col + 1
+    # If any are missing, fall back to A01/A02/A03 or positional next to pay rate
+    if not reg_col:
+        reg_col = col_eq("a01")
+    if not ot_col:
+        ot_col  = col_eq("a02")
+    if not dt_col:
+        dt_col  = col_eq("a03")
+
+    # If still missing, place them immediately right of Pay Rate
+    if not reg_col: reg_col = payrate_col + 1
+    if not ot_col:  ot_col  = reg_col + 1
+    if not dt_col:  dt_col  = ot_col + 1
+    # -----------------------------------------------------------------------
 
     # Totals candidates:
     totals_candidates: List[int] = []
@@ -334,8 +338,8 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     if last_header_col not in totals_candidates:
         totals_candidates.append(last_header_col)
     # 4) dt+1 as a safety
-    if (a03_col + 1) not in totals_candidates:
-        totals_candidates.append(a03_col + 1)
+    if (dt_col + 1) not in totals_candidates:
+        totals_candidates.append(dt_col + 1)
 
     # Optional IDs
     empid_col  = col_eq("# e:26") or col_has("emp id") or col_has("empid")
@@ -359,23 +363,19 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
         # Rates + buckets (FORCED)
         rate_val = row["Pay Rate"] if row["Pay Rate"] != "" else None
         ws.cell(row=r, column=payrate_col, value=rate_val)
-        ws.cell(row=r, column=a01_col, value=round(float(row["REGULAR"]), 3))
-        ws.cell(row=r, column=a02_col, value=round(float(row["OVERTIME"]), 3))
-        ws.cell(row=r, column=a03_col, value=round(float(row["DOUBLETIME"]), 3))
+        ws.cell(row=r, column=reg_col, value=round(float(row["REGULAR"]), 3))
+        ws.cell(row=r, column=ot_col,  value=round(float(row["OVERTIME"]), 3))
+        ws.cell(row=r, column=dt_col,  value=round(float(row["DOUBLETIME"]), 3))
 
-        # Totals: write to ALL candidates (value + formula), so one WILL be your pink column
-        total_val = float(row["Totals"] or 0.0)
+        # Totals: write FORMULA to all candidates so one WILL be your pink column
         rate_ref = f"{get_column_letter(payrate_col)}{r}"
-        reg_ref  = f"{get_column_letter(a01_col)}{r}"
-        ot_ref   = f"{get_column_letter(a02_col)}{r}"
-        dt_ref   = f"{get_column_letter(a03_col)}{r}"
+        reg_ref  = f"{get_column_letter(reg_col)}{r}"
+        ot_ref   = f"{get_column_letter(ot_col)}{r}"
+        dt_ref   = f"{get_column_letter(dt_col)}{r}"
         formula = f"=({reg_ref}*{rate_ref})+({ot_ref}*1.5*{rate_ref})+({dt_ref}*2*{rate_ref})"
-
         for tcol in totals_candidates:
-            # don't exceed worksheet width
             if tcol is None or tcol < 1:
                 continue
-            ws.cell(row=r, column=tcol, value=total_val)
             ws.cell(row=r, column=tcol).value = formula
 
         r += 1
@@ -389,12 +389,12 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     dbg.append([])
     dbg.append(["Chosen columns →",
                 "Pay Rate", payrate_col,
-                "A01", a01_col,
-                "A02", a02_col,
-                "A03", a03_col,
+                "REG", reg_col,
+                "OT", ot_col,
+                "DT", dt_col,
                 "Totals candidates", ", ".join(str(c) for c in totals_candidates)])
     dbg.append([])
-    dbg.append(["First 25 rows (Name, Rate, REG, OT, DT, TotalVal)"])
+    dbg.append(["First 25 rows (Name, Rate, REG, OT, DT, Totals calc preview)"])
     for row in rows[:25]:
         dbg.append([
             row["Employee Name"],
@@ -402,7 +402,7 @@ def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
             row["REGULAR"],
             row["OVERTIME"],
             row["DOUBLETIME"],
-            row["Totals"],
+            _calc_totals("H", row["REGULAR"], row["OVERTIME"], row["DOUBLETIME"], row["Pay Rate"], row["Pay Rate"]),
         ])
 
     bio = io.BytesIO()
