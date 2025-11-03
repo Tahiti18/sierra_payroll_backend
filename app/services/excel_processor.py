@@ -1,23 +1,18 @@
 # app/services/excel_processor.py
-# Sierra → WBS (FULLY CALCULATED, HEADER-SAFE, BLANK-TEMPLATE TOLERANT)
-# - Works with a nearly blank wbs_template.xlsx (will create headers if missing)
-# - Reads Sierra daily logs (Days, Name, Hours, Rate)
-# - Accepts Days as real dates OR weekday text ("Mon", "Tue", ...), maps to Mon=0..Sun=6
-# - Splits hours into REG (≤8/day), OT (8–12/day), DT (>12/day) + overlays WEEKLY >40 into OT
-# - Computes Mon–Fri per-day hours and per-day totals (HRS × Pay Rate)
-# - Fills Status/Type/Dept/SSN/EmpID from roster.xlsx when available
-# - Writes blanks instead of zeros; writes fixed numeric Totals (no Excel formulas)
-# - Preserves WBS name order (existing names first), then A–Z by last name
+# Sierra → WBS translator (FULL FILE – computes Hours from Start/Lunch/Finish; no dependency on prefilled template numbers)
+
 from __future__ import annotations
 
-import io, re
+import io
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 
 import pandas as pd
-from openpyxl import load_workbook, Workbook
+from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.utils import get_column_letter
 
 # ---------- Paths ----------
 HERE = Path(__file__).resolve().parent
@@ -70,147 +65,204 @@ def _normalize_name_for_join(name: str) -> Tuple[str, str]:
 def _best_join(left_df: pd.DataFrame, right_df: pd.DataFrame,
                left_name_col: str, right_name_col: str) -> pd.DataFrame:
     L = left_df.copy(); R = right_df.copy()
-    L[["__ln", "__fn"]] = L[left_name_col].apply(lambda s: pd.Series(_normalize_name_for_join(str(s))))
-    R[["__ln", "__fn"]] = R[right_name_col].apply(lambda s: pd.Series(_normalize_name_for_join(str(s))))
-    M = pd.merge(L, R, on=["__ln", "__fn"], how="left", suffixes=("", "_roster"))
-    return M.drop(columns=["__ln", "__fn"])
-
-def _last_name_key(full_name: str) -> Tuple[str, str]:
-    s = str(full_name or "").strip()
-    if not s:
-        return ("", "")
-    if "," in s:
-        last, rest = [x.strip() for x in s.split(",", 1)]
-        first = rest.split(" ")[0] if rest else ""
-    else:
-        parts = s.split()
-        first = parts[0]
-        last = parts[-1]
-    ln = "".join(ch for ch in last.lower() if ch.isalpha())
-    fn = "".join(ch for ch in first.lower() if ch.isalpha())
-    return (ln, fn)
-
-def _nz_or_blank(v: Optional[float]) -> Optional[float]:
-    if v is None:
-        return None
-    try:
-        f = float(v)
-        return None if abs(f) < 1e-9 else round(f, 3)
-    except Exception:
-        return None
-
-def _norm_label(s: str) -> str:
-    return "".join(ch for ch in str(s).lower() if ch.isalnum())
+    L[["__ln","__fn"]] = L[left_name_col].apply(lambda s: pd.Series(_normalize_name_for_join(str(s))))
+    R[["__ln","__fn"]] = R[right_name_col].apply(lambda s: pd.Series(_normalize_name_for_join(str(s))))
+    M = pd.merge(L, R, on=["__ln","__fn"], how="left", suffixes=("", "_roster"))
+    return M.drop(columns=["__ln","__fn"])
 
 # ---------- Sierra detection ----------
 @dataclass
 class SierraLayout:
     header_row: int
     name_idx: int
-    hours_idx: int
+    hours_idx: Optional[int]
     rate_idx: Optional[int]
-    days_idx: Optional[int]
+    day_idx: Optional[int]
+    start_idx: Optional[int]
+    lnch_st_idx: Optional[int]
+    lnch_fn_idx: Optional[int]
+    finish_idx: Optional[int]
+
+_SIERRA_HOURS_ALIASES = {"hours", "hrs", "total hours"}
+_SIERRA_START_ALIASES = {"start", "time in"}
+_SIERRA_LUNCH_ST_ALIASES = {"lnch st", "lunch st", "lunch start", "lnch start"}
+_SIERRA_LUNCH_FN_ALIASES = {"lnch fnsh", "lunch fnsh", "lunch finish", "lnch finish", "lunch end"}
+_SIERRA_FINISH_ALIASES = {"finish", "time out", "end"}
+_SIERRA_RATE_ALIASES = {"rate", "pay rate"}
+_SIERRA_DAY_ALIASES = {"days", "date", "day"}
 
 def _detect_sierra_layout(df: pd.DataFrame) -> Optional[SierraLayout]:
-    for r in range(min(60, len(df))):
-        row = df.iloc[r].astype(str).str.strip().str.lower()
-        if "name" in set(row.values) and "hours" in set(row.values):
-            name_idx  = row[row == "name"].index[0]
-            hours_idx = row[row == "hours"].index[0]
-            rate_idx  = row[row == "rate"].index[0] if any(row == "rate") else None
-            days_idx  = row[row == "days"].index[0] if any(row == "days") else None
-            return SierraLayout(r, name_idx, hours_idx, rate_idx, days_idx)
+    for r in range(min(80, len(df))):
+        row_vals = [str(x).strip().lower() for x in df.iloc[r].values]
+        if "name" in row_vals:
+            # collect indices for likely columns
+            idx_name   = row_vals.index("name")
+            idx_hours  = next((i for i, v in enumerate(row_vals) if v in _SIERRA_HOURS_ALIASES), None)
+            idx_rate   = next((i for i, v in enumerate(row_vals) if v in _SIERRA_RATE_ALIASES), None)
+            idx_day    = next((i for i, v in enumerate(row_vals) if v in _SIERRA_DAY_ALIASES), None)
+            idx_start  = next((i for i, v in enumerate(row_vals) if v in _SIERRA_START_ALIASES), None)
+            idx_l_st   = next((i for i, v in enumerate(row_vals) if v in _SIERRA_LUNCH_ST_ALIASES), None)
+            idx_l_fn   = next((i for i, v in enumerate(row_vals) if v in _SIERRA_LUNCH_FN_ALIASES), None)
+            idx_finish = next((i for i, v in enumerate(row_vals) if v in _SIERRA_FINISH_ALIASES), None)
+            return SierraLayout(
+                header_row=r,
+                name_idx=idx_name,
+                hours_idx=idx_hours,
+                rate_idx=idx_rate,
+                day_idx=idx_day,
+                start_idx=idx_start,
+                lnch_st_idx=idx_l_st,
+                lnch_fn_idx=idx_l_fn,
+                finish_idx=idx_finish,
+            )
     return None
 
-# ---------- Read + aggregate ----------
-def _read_sierra_records(xlsx_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame]:
+# ---------- time parsing ----------
+def _parse_time_cell(x) -> Optional[pd.Timestamp]:
+    """Return a pandas Timestamp today with the time parsed from cell x; None if not parseable."""
+    if pd.isna(x) or x is None:
+        return None
+    # Excel time numbers (fraction of a day)
+    if isinstance(x, (int, float)) and 0 <= float(x) < 2:
+        try:
+            # pandas date origin is 1899-12-30 for Excel serials; but for pure time, treat as seconds
+            seconds = float(x) * 24 * 3600
+            base = pd.Timestamp("2000-01-01")
+            return base + pd.to_timedelta(seconds, unit="s")
+        except Exception:
+            pass
+    # Strings like '8:00', '11:30', '4:30 PM'
+    try:
+        s = str(x).strip()
+        # sometimes '8' or '8.0'
+        if re.fullmatch(r"\d{1,2}(\.\d+)?", s):
+            s = s.split(".", 1)[0] + ":00"
+        return pd.to_datetime(s, errors="raise", infer_datetime_format=True)
+    except Exception:
+        return None
+
+def _compute_hours_from_row(row: pd.Series,
+                            start_col: Optional[str],
+                            lnch_st_col: Optional[str],
+                            lnch_fn_col: Optional[str],
+                            finish_col: Optional[str]) -> Optional[float]:
+    if not start_col or not finish_col:
+        return None
+    t_in = _parse_time_cell(row.get(start_col))
+    t_out = _parse_time_cell(row.get(finish_col))
+    if t_in is None or t_out is None:
+        return None
+    base = pd.Timestamp("2000-01-01")
+    if t_out < base:
+        t_out = base.replace(hour=t_out.hour, minute=t_out.minute, second=t_out.second)
+    if t_in < base:
+        t_in = base.replace(hour=t_in.hour, minute=t_in.minute, second=t_in.second)
+    gross = (t_out - t_in).total_seconds() / 3600.0
+    lunch = 0.0
+    if lnch_st_col and lnch_fn_col:
+        l_in = _parse_time_cell(row.get(lnch_st_col))
+        l_out = _parse_time_cell(row.get(lnch_fn_col))
+        if l_in is not None and l_out is not None:
+            lunch = max(0.0, (l_out - l_in).total_seconds() / 3600.0)
+    hours = gross - lunch
+    # sanitize
+    if hours is None or hours < 0 or hours > 24:
+        return None
+    return round(hours, 3)
+
+# ---------- Read + aggregate with daily OT/DT + weekly overlay ----------
+def _read_sierra_records(xlsx_bytes: bytes) -> pd.DataFrame:
     """
-    Returns:
-      agg: DF(Name, Reg_sum, OT_sum, DT_sum, Rate_last)
-      per_day: DF(Name, Weekday (0=Mon..6=Sun), Hours, Rate_last)
+    Returns DF columns: Name, Reg_sum, OT_sum, DT_sum, Rate_last
     """
     bio = io.BytesIO(xlsx_bytes)
     df0 = pd.read_excel(bio, sheet_name=0, header=None)
     layout = _detect_sierra_layout(df0)
     if not layout:
-        raise ValueError("Could not detect Sierra header row with 'Name' and 'Hours'.")
+        raise ValueError("Could not detect Sierra header row (need 'Name' plus time columns).")
 
     bio.seek(0)
     df = pd.read_excel(bio, sheet_name=0, header=layout.header_row)
     df.columns = [str(c).strip() for c in df.columns]
 
-    name_col  = df.columns[layout.name_idx]
-    hours_col = df.columns[layout.hours_idx]
-    df = df.rename(columns={name_col: "Name", hours_col: "Hours"})
-    if layout.rate_idx is not None:
-        rate_name = df.columns[layout.rate_idx]
-        if rate_name not in ("Name", "Hours"):
-            df = df.rename(columns={rate_name: "Rate"})
-    if layout.days_idx is not None:
-        days_name = df.columns[layout.days_idx]
-        df = df.rename(columns={days_name: "Days"})
+    # map detected indices to column names
+    def _colname(idx: Optional[int]) -> Optional[str]:
+        if idx is None:
+            return None
+        try:
+            return df.columns[idx]
+        except Exception:
+            return None
 
+    name_col   = df.columns[layout.name_idx]
+    df = df.rename(columns={name_col: "Name"})
+    hours_col  = _colname(layout.hours_idx)
+    rate_col   = _colname(layout.rate_idx)
+    day_col    = _colname(layout.day_idx)
+    start_col  = _colname(layout.start_idx)
+    lnch_st_col= _colname(layout.lnch_st_idx)
+    lnch_fn_col= _colname(layout.lnch_fn_idx)
+    finish_col = _colname(layout.finish_idx)
+
+    # Clean names
     df["Name"] = df["Name"].astype(str).str.strip()
     df = df[df["Name"] != ""].copy()
-    df["Hours_num"] = df["Hours"].apply(_num)
-    df = df[df["Hours_num"].notnull()].copy()
-    df["Rate_num"] = df["Rate"].apply(_num) if "Rate" in df.columns else None
 
-    # Weekday detection: real dates OR weekday text ("Mon", "Tue", ...)
-    weekday_map = {
-        "monday":0, "mon":0,
-        "tuesday":1, "tue":1, "tues":1,
-        "wednesday":2, "wed":2,
-        "thursday":3, "thu":3, "thur":3, "thurs":3,
-        "friday":4, "fri":4,
-        "saturday":5, "sat":5,
-        "sunday":6, "sun":6
-    }
-
-    def to_weekday(val) -> Optional[int]:
-        # Try real date
-        try:
-            d = pd.to_datetime(val, errors="raise")
-            return int(d.weekday())
-        except Exception:
-            pass
-        # Try text
-        s = str(val).strip().lower()
-        letters = "".join(ch for ch in s if ch.isalpha())  # tolerate "Mon." or "Mon – 9/16"
-        return weekday_map.get(letters, None)
-
-    if "Days" in df.columns:
-        df["Weekday"] = df["Days"].apply(to_weekday)
+    # Get numeric hours: prefer explicit Hours column; else compute from time columns
+    if hours_col and hours_col in df.columns:
+        df["Hours_num"] = df[hours_col].apply(_num)
     else:
-        df["Weekday"] = None
+        df["Hours_num"] = df.apply(
+            lambda r: _compute_hours_from_row(r, start_col, lnch_st_col, lnch_fn_col, finish_col),
+            axis=1
+        )
 
-    per_day_raw = (df.groupby(["Name", "Weekday"], dropna=False)
-                     .agg(Hours=("Hours_num", "sum"),
-                          Rate_last=("Rate_num", "last"))
-                     .reset_index())
+    df = df[df["Hours_num"].notnull()].copy()
 
-    # Daily split for REG/OT/DT
-    def split_daily(h: float) -> Tuple[float, float, float]:
+    # Rate (last non-null per name)
+    if rate_col and rate_col in df.columns:
+        df["Rate_num"] = df[rate_col].apply(_num)
+    else:
+        df["Rate_num"] = None
+
+    # Day key for daily split
+    if day_col and day_col in df.columns:
+        df["DayKey"] = pd.to_datetime(df[day_col], errors="coerce").dt.date
+    else:
+        # No explicit day column → treat each row as its own day bucket
+        df["DayKey"] = pd.NaT
+
+    # Aggregate per-day
+    per_day = (
+        df.groupby(["Name", "DayKey"], dropna=False)
+          .agg(DayHours=("Hours_num","sum"),
+               Rate_last=("Rate_num","last"))
+          .reset_index()
+    )
+    per_day = per_day[per_day["Name"].notna() & (per_day["Name"].astype(str).str.strip()!="")]
+
+    def split_daily(h: float) -> Tuple[float,float,float]:
         if h is None:
-            return (0.0, 0.0, 0.0)
+            return (0.0,0.0,0.0)
         reg = min(h, 8.0)
-        ot  = min(max(h - 8.0, 0.0), 4.0)
-        dt  = max(h - 12.0, 0.0)
+        ot  = min(max(h-8.0, 0.0), 4.0)
+        dt  = max(h-12.0, 0.0)
         return (reg, ot, dt)
 
-    per_day = per_day_raw.copy()
-    per_day[["Reg", "OT", "DT"]] = per_day["Hours"].apply(lambda h: pd.Series(split_daily(h)))
+    per_day[["Reg","OT","DT"]] = per_day["DayHours"].apply(lambda h: pd.Series(split_daily(h)))
 
-    per_emp = (per_day.groupby("Name", dropna=False)
-                        .agg(Reg_sum=("Reg", "sum"),
-                             OT_sum=("OT", "sum"),
-                             DT_sum=("DT", "sum"),
-                             Rate_last=("Rate_last", "last"))
-                        .reset_index())
+    # Per employee, then weekly overlay >40
+    per_emp = (
+        per_day.groupby("Name", dropna=False)
+               .agg(Reg_sum=("Reg","sum"),
+                    OT_sum=("OT","sum"),
+                    DT_sum=("DT","sum"),
+                    Rate_last=("Rate_last","last"))
+               .reset_index()
+    )
 
-    # Weekly overlay >40
     def weekly_adjust(row):
-        total = float((row["Reg_sum"] or 0) + (row["OT_sum"] or 0) + (row["DT_sum"] or 0))
+        total = float(row["Reg_sum"] + row["OT_sum"] + row["DT_sum"])
         if total > 40.0:
             extra = total - 40.0
             pull = min(extra, row["Reg_sum"])
@@ -222,12 +274,15 @@ def _read_sierra_records(xlsx_bytes: bytes) -> Tuple[pd.DataFrame, pd.DataFrame]
         return row
 
     per_emp = per_emp.apply(weekly_adjust, axis=1)
-    agg = per_emp[per_emp["Name"].notna() & (per_emp["Name"].astype(str).str.strip() != "")]
-    return agg, per_day_raw
+    return per_emp
 
 # ---------- Roster (OPTIONAL) ----------
 def _load_roster() -> pd.DataFrame:
-    expected = ["EmpID", "SSN", "Employee Name", "Status", "Type", "PayRate", "Dept"]
+    """
+    Try to load roster.xlsx; if missing, return empty roster so conversion continues.
+    Expected sheet 'Roster' with columns: EmpID, SSN, Employee Name, Status, Type, PayRate, Dept
+    """
+    expected = ["EmpID","SSN","Employee Name","Status","Type","PayRate","Dept"]
     candidates = [
         ROSTER_PATH,
         REPO_ROOT / "roster.xlsx",
@@ -254,7 +309,7 @@ def _load_roster() -> pd.DataFrame:
     roster["EmployeeNameRoster"] = roster["Employee Name"].astype(str)
     return roster
 
-# ---------- assemble computed rows ----------
+# ---------- assemble rows ----------
 def _pad_empid(empid: Optional[int]) -> Optional[str]:
     if empid is None:
         return None
@@ -267,50 +322,29 @@ def _pad_empid(empid: Optional[int]) -> Optional[str]:
 
 def _calc_totals(pay_type: str, reg: float, ot: float, dt: float,
                  rate: Optional[float], default_payrate: Optional[float]) -> float:
-    if str(pay_type or "").upper().startswith("S"):
+    # Salaried → roster PayRate is period total
+    if str(pay_type).upper().startswith("S"):
         return float(_num(default_payrate) or 0.0)
     r = _num(rate) or _num(default_payrate) or 0.0
     return float((reg * r) + (ot * 1.5 * r) + (dt * 2.0 * r))
 
-def _build_rows(agg: pd.DataFrame, per_day_hours: pd.DataFrame, roster: pd.DataFrame) -> List[Dict[str, object]]:
-    # Per-employee weekday hours pivot (0..6)
-    day_pivot = (per_day_hours
-                 .assign(Weekday=lambda d: d["Weekday"].apply(lambda x: int(x) if pd.notna(x) else -1))
-                 .query("Weekday >= 0 and Weekday <= 6")
-                 .pivot_table(index="Name", columns="Weekday", values="Hours", aggfunc="sum", fill_value=0.0))
-
+def _build_rows(agg: pd.DataFrame, roster: pd.DataFrame) -> List[Dict[str,object]]:
     joined = _best_join(agg, roster, "Name", "EmployeeNameRoster")
-    out: List[Dict[str, object]] = []
+    out: List[Dict[str,object]] = []
     for _, r in joined.iterrows():
         name_src = str(r["Name"]).strip()
-        reg = float(r.get("Reg_sum", 0.0) or 0.0)
-        ot  = float(r.get("OT_sum", 0.0) or 0.0)
-        dt  = float(r.get("DT_sum", 0.0) or 0.0)
+        reg = float(r.get("Reg_sum",0.0) or 0.0)
+        ot  = float(r.get("OT_sum",0.0) or 0.0)
+        dt  = float(r.get("DT_sum",0.0) or 0.0)
         rate_si = r.get("Rate_last")
 
         empid = r.get("EmpID_clean"); ssn = r.get("SSN_clean")
         name_roster = r.get("EmployeeNameRoster")
-        status = r.get("Status", "A"); ptype = r.get("Type", "H")
+        status = r.get("Status","A"); ptype = r.get("Type","H")
         payrate_roster = r.get("PayRate"); dept = r.get("Dept")
 
         name_final = str(name_roster).strip() if pd.notna(name_roster) and str(name_roster).strip() else name_src
         rate_final = _num(payrate_roster) if _num(payrate_roster) is not None else _num(rate_si)
-        r_use = _num(rate_final) or 0.0
-
-        # Per-day hours (Mon..Fri indices 0..4)
-        h_mon = float(day_pivot.loc[name_src, 0]) if (name_src in day_pivot.index and 0 in day_pivot.columns) else 0.0
-        h_tue = float(day_pivot.loc[name_src, 1]) if (name_src in day_pivot.index and 1 in day_pivot.columns) else 0.0
-        h_wed = float(day_pivot.loc[name_src, 2]) if (name_src in day_pivot.index and 2 in day_pivot.columns) else 0.0
-        h_thu = float(day_pivot.loc[name_src, 3]) if (name_src in day_pivot.index and 3 in day_pivot.columns) else 0.0
-        h_fri = float(day_pivot.loc[name_src, 4]) if (name_src in day_pivot.index and 4 in day_pivot.columns) else 0.0
-
-        # Per-day totals
-        t_mon = h_mon * r_use
-        t_tue = h_tue * r_use
-        t_wed = h_wed * r_use
-        t_thu = h_thu * r_use
-        t_fri = h_fri * r_use
-
         totals_val = _calc_totals(str(ptype or "H"), reg, ot, dt, rate_final, payrate_roster)
 
         out.append({
@@ -319,180 +353,140 @@ def _build_rows(agg: pd.DataFrame, per_day_hours: pd.DataFrame, roster: pd.DataF
             "Employee Name": name_final,
             "Status": status if pd.notna(status) else "A",
             "Type": ptype if pd.notna(ptype) else "H",
-            "Dept": dept if pd.notna(dept) else "",
             "Pay Rate": rate_final if rate_final is not None else "",
+            "Dept": dept if pd.notna(dept) else "",
             "REGULAR": reg,
             "OVERTIME": ot,
             "DOUBLETIME": dt,
-            "PC HRS MON": h_mon, "PC HRS TUE": h_tue, "PC HRS WED": h_wed, "PC HRS THU": h_thu, "PC HRS FRI": h_fri,
-            "PC TTL MON": t_mon, "PC TTL TUE": t_tue, "PC TTL WED": t_wed, "PC TTL THU": t_thu, "PC TTL FRI": t_fri,
             "Totals": totals_val,
         })
     return out
 
-# ---------- header handling (creates if missing) ----------
-REQUIRED_HEADERS = [
-    "EmpID", "SSN", "Employee Name", "Status", "Type", "Dept", "Pay Rate",
-    "REGULAR", "OVERTIME", "DOUBLETIME",
-    "PC HRS MON", "PC TTL MON",
-    "PC HRS TUE", "PC TTL TUE",
-    "PC HRS WED", "PC TTL WED",
-    "PC HRS THU", "PC TTL THU",
-    "PC HRS FRI", "PC TTL FRI",
-    "Totals"
-]
-
-def _ensure_headers(ws: Worksheet, header_row: int) -> Dict[str, int]:
-    """
-    Ensures a usable header row exists. If the row has no labels,
-    this function writes REQUIRED_HEADERS across it.
-    Returns a dict of column indices by header label (1-based).
-    """
-    # Read current headers
-    existing = [str(c.value or "").strip() for c in ws[header_row]]
-    has_any_label = any(bool(x) for x in existing)
-
-    if not has_any_label:
-        # Create required headers from scratch
-        for idx, label in enumerate(REQUIRED_HEADERS, start=1):
-            ws.cell(row=header_row, column=idx, value=label)
-        header_map = {label: i+1 for i, label in enumerate(REQUIRED_HEADERS)}
-        return header_map
-
-    # If headers exist, map what we find; create any missing essentials at the end.
-    header_map: Dict[str, int] = {}
-    # Build quick lookup with normalized labels
-    norm_to_idx = {}
-    for i, label in enumerate(existing, start=1):
-        n = _norm_label(label)
-        if n:
-            norm_to_idx[n] = i
-
-    def find_or_create(label: str) -> int:
-        n = _norm_label(label)
-        if n in norm_to_idx:
-            return norm_to_idx[n]
-        # append at the end
-        col = (len(existing) if existing else 0) + 1 + len([k for k in header_map if k not in existing])
-        ws.cell(row=header_row, column=col, value=label)
-        norm_to_idx[n] = col
-        return col
-
-    for label in REQUIRED_HEADERS:
-        header_map[label] = find_or_create(label)
-
-    return header_map
-
-# ---------- main ----------
+# ---------- main: Sierra (bytes) → WBS (bytes) ----------
 def sierra_excel_to_wbs_bytes(xlsx_bytes: bytes) -> bytes:
     if not WBS_TEMPLATE_PATH.exists():
-        # If template truly missing, create a new workbook with WEEKLY and headers
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "WEEKLY"
+        raise FileNotFoundError(f"WBS template not found at {WBS_TEMPLATE_PATH}")
+
+    agg = _read_sierra_records(xlsx_bytes)
+    roster = _load_roster()
+    rows = _build_rows(agg, roster)
+
+    wb = load_workbook(WBS_TEMPLATE_PATH)
+    ws: Worksheet = wb["WEEKLY"] if "WEEKLY" in wb.sheetnames else next((wb[s] for s in wb.sheetnames if "week" in s.lower()), wb.active)
+
+    # find header row (6–12 range)
+    header_row = None
+    header_score = -1
+    for r in range(6, 13):
+        vals = [str(c.value or "").strip() for c in ws[r]]
+        score = sum(1 for v in vals if v)
+        if score > header_score:
+            header_score = score
+            header_row = r
+    if header_row is None:
         header_row = 8
-        header_map = _ensure_headers(ws, header_row)
-    else:
-        wb = load_workbook(WBS_TEMPLATE_PATH)
-        ws: Worksheet = wb["WEEKLY"] if "WEEKLY" in wb.sheetnames else next((wb[s] for wb_s in wb.sheetnames for s in [wb_s] if "week" in s.lower()), wb.active)
-
-        # Locate header row: scan rows 6–12; pick row with most labels
-        header_row = None
-        best_score = -1
-        for r in range(6, 13):
-            vals = [str(c.value or "").strip() for c in ws[r]]
-            score = sum(1 for v in vals if v)
-            if score > best_score:
-                best_score = score
-                header_row = r
-        if header_row is None:
-            header_row = 8
-
-        # Ensure headers exist (and create missing essentials if needed)
-        header_map = _ensure_headers(ws, header_row)
-
     DATA_START = header_row + 1
 
-    # Read + compute
-    agg, per_day_hours = _read_sierra_records(xlsx_bytes)
-    roster = _load_roster()
-    rows = _build_rows(agg, per_day_hours, roster)
-
-    # Capture existing order (fixed top block)
-    existing_order: List[str] = []
-    name_col_idx = header_map.get("Employee Name")
-    if name_col_idx:
-        for rr in range(DATA_START, ws.max_row + 1):
-            val = ws.cell(row=rr, column=name_col_idx).value
-            if val and str(val).strip():
-                existing_order.append(str(val).strip())
-
-    # Clear old data
+    # clear existing data lines
     if ws.max_row >= DATA_START:
         ws.delete_rows(DATA_START, ws.max_row - DATA_START + 1)
 
-    # Ordering: existing first, others A–Z by last name
-    existing_index = {name: idx for idx, name in enumerate(existing_order)} if existing_order else {}
+    # headers
+    hdr_raw   = [str(c.value or "").strip() for c in ws[header_row]]
+    hdr_lower = [h.lower() for h in hdr_raw]
+    last_header_col = len(hdr_raw) if hdr_raw else 20
 
-    def sort_key(row: Dict[str, object]) -> Tuple[int, Tuple[str, str]]:
-        nm = str(row["Employee Name"] or "").strip()
-        pri = existing_index.get(nm, 10**9)
-        return (pri, _last_name_key(nm))
+    def col_eq(label: str) -> Optional[int]:
+        lbl = label.strip().lower()
+        for i, txt in enumerate(hdr_lower, start=1):
+            if txt == lbl:
+                return i
+        return None
 
-    rows_sorted = sorted(rows, key=sort_key)
+    def col_has(substr: str) -> Optional[int]:
+        s = substr.strip().lower()
+        for i, txt in enumerate(hdr_lower, start=1):
+            if txt and s in txt:
+                return i
+        return None
 
-    # Column indices
-    col = header_map  # alias
+    # Pay Rate and buckets
+    payrate_col = col_eq("pay rate") or col_has("rate")
+    if not payrate_col:
+        for guess in (6,7,8,9,10):
+            if guess <= last_header_col:
+                payrate_col = guess
+                break
+    if not payrate_col:
+        payrate_col = 7
 
-    # Write rows
+    a01_col = col_eq("a01") or col_eq("regular")
+    a02_col = col_eq("a02") or col_eq("overtime")
+    a03_col = col_eq("a03") or col_has("double")
+
+    if not a01_col: a01_col = payrate_col + 1
+    if not a02_col: a02_col = a01_col + 1
+    if not a03_col: a03_col = a02_col + 1
+
+    # Totals destinations
+    totals_candidates: List[int] = []
+    for i, txt in enumerate(hdr_lower, start=1):
+        if "total" in txt and i not in totals_candidates:
+            totals_candidates.append(i)
+    right_most_labeled = max([i for i, t in enumerate(hdr_raw, start=1) if str(t).strip()], default=None)
+    if right_most_labeled and right_most_labeled not in totals_candidates:
+        totals_candidates.append(right_most_labeled)
+    if last_header_col not in totals_candidates:
+        totals_candidates.append(last_header_col)
+    if (a03_col + 1) not in totals_candidates:
+        totals_candidates.append(a03_col + 1)
+    totals_candidates = [c for c in totals_candidates if isinstance(c, int) and c >= 1]
+
+    # Optional identity columns
+    empid_col  = col_eq("# e:26") or col_has("emp id") or col_has("empid")
+    ssn_col    = col_eq("ssn")
+    name_col   = col_eq("employee name") or col_eq("name")
+    status_col = col_eq("status")
+    type_col   = col_eq("type") or col_has("pay type")
+    dept_col   = col_eq("dept") or col_eq("department")
+
+    # write rows
     r = DATA_START
-    for row in rows_sorted:
-        if col.get("EmpID"):        ws.cell(row=r, column=col["EmpID"],        value=row["EmpID"])
-        if col.get("SSN"):          ws.cell(row=r, column=col["SSN"],          value=row["SSN"])
-        if col.get("Employee Name"):ws.cell(row=r, column=col["Employee Name"],value=row["Employee Name"])
-        if col.get("Status"):       ws.cell(row=r, column=col["Status"],       value=row["Status"])
-        if col.get("Type"):         ws.cell(row=r, column=col["Type"],         value=row["Type"])
-        if col.get("Dept"):         ws.cell(row=r, column=col["Dept"],         value=row["Dept"])
-        if col.get("Pay Rate"):     ws.cell(row=r, column=col["Pay Rate"],     value=row["Pay Rate"] if row["Pay Rate"] != "" else None)
+    for row in rows:
+        if empid_col:  ws.cell(row=r, column=empid_col,  value=row["EmpID"])
+        if ssn_col:    ws.cell(row=r, column=ssn_col,    value=row["SSN"])
+        if name_col:   ws.cell(row=r, column=name_col,   value=row["Employee Name"])
+        if status_col: ws.cell(row=r, column=status_col, value=row["Status"])
+        if type_col:   ws.cell(row=r, column=type_col,   value=row["Type"])
+        if dept_col:   ws.cell(row=r, column=dept_col,   value=row["Dept"])
 
-        if col.get("REGULAR"):      ws.cell(row=r, column=col["REGULAR"],      value=_nz_or_blank(row["REGULAR"]))
-        if col.get("OVERTIME"):     ws.cell(row=r, column=col["OVERTIME"],     value=_nz_or_blank(row["OVERTIME"]))
-        if col.get("DOUBLETIME"):   ws.cell(row=r, column=col["DOUBLETIME"],   value=_nz_or_blank(row["DOUBLETIME"]))
+        rate_val = row["Pay Rate"] if row["Pay Rate"] != "" else None
+        ws.cell(row=r, column=payrate_col, value=rate_val)
+        ws.cell(row=r, column=a01_col, value=round(float(row["REGULAR"]), 3))
+        ws.cell(row=r, column=a02_col, value=round(float(row["OVERTIME"]), 3))
+        ws.cell(row=r, column=a03_col, value=round(float(row["DOUBLETIME"]), 3))
 
-        if col.get("PC HRS MON"):   ws.cell(row=r, column=col["PC HRS MON"],   value=_nz_or_blank(row["PC HRS MON"]))
-        if col.get("PC HRS TUE"):   ws.cell(row=r, column=col["PC HRS TUE"],   value=_nz_or_blank(row["PC HRS TUE"]))
-        if col.get("PC HRS WED"):   ws.cell(row=r, column=col["PC HRS WED"],   value=_nz_or_blank(row["PC HRS WED"]))
-        if col.get("PC HRS THU"):   ws.cell(row=r, column=col["PC HRS THU"],   value=_nz_or_blank(row["PC HRS THU"]))
-        if col.get("PC HRS FRI"):   ws.cell(row=r, column=col["PC HRS FRI"],   value=_nz_or_blank(row["PC HRS FRI"]))
+        total_val = float(row["Totals"] or 0.0)
+        rate_ref = f"{get_column_letter(payrate_col)}{r}"
+        reg_ref  = f"{get_column_letter(a01_col)}{r}"
+        ot_ref   = f"{get_column_letter(a02_col)}{r}"
+        dt_ref   = f"{get_column_letter(a03_col)}{r}"
+        formula = f"=({reg_ref}*{rate_ref})+({ot_ref}*1.5*{rate_ref})+({dt_ref}*2*{rate_ref})"
 
-        if col.get("PC TTL MON"):   ws.cell(row=r, column=col["PC TTL MON"],   value=_nz_or_blank(row["PC TTL MON"]))
-        if col.get("PC TTL TUE"):   ws.cell(row=r, column=col["PC TTL TUE"],   value=_nz_or_blank(row["PC TTL TUE"]))
-        if col.get("PC TTL WED"):   ws.cell(row=r, column=col["PC TTL WED"],   value=_nz_or_blank(row["PC TTL WED"]))
-        if col.get("PC TTL THU"):   ws.cell(row=r, column=col["PC TTL THU"],   value=_nz_or_blank(row["PC TTL THU"]))
-        if col.get("PC TTL FRI"):   ws.cell(row=r, column=col["PC TTL FRI"],   value=_nz_or_blank(row["PC TTL FRI"]))
-
-        if col.get("Totals"):       ws.cell(row=r, column=col["Totals"],       value=_nz_or_blank(row["Totals"]))
+        for tcol in totals_candidates:
+            if tcol is None or tcol < 1:
+                continue
+            ws.cell(row=r, column=tcol, value=total_val)
+            ws.cell(row=r, column=tcol).value = formula
 
         r += 1
 
-    # DEBUG sheet
+    # optional DEBUG removal if present
     if "DEBUG" in wb.sheetnames:
-        wb.remove(wb["DEBUG"])
-    dbg = wb.create_sheet("DEBUG")
-    dbg.append([f"Header row: {header_row}"])
-    dbg.append(["Headers snapshot (label → col)"])
-    for k in REQUIRED_HEADERS:
-        dbg.append([k, header_map.get(k, None)])
-    dbg.append([])
-    dbg.append(["First 20 rows preview (Name, Rate, REG, OT, DT, HRS Mon–Fri, TTL Mon–Fri, Totals)"])
-    for row in rows_sorted[:20]:
-        dbg.append([
-            row["Employee Name"], row["Pay Rate"],
-            row["REGULAR"], row["OVERTIME"], row["DOUBLETIME"],
-            row["PC HRS MON"], row["PC HRS TUE"], row["PC HRS WED"], row["PC HRS THU"], row["PC HRS FRI"],
-            row["PC TTL MON"], row["PC TTL TUE"], row["PC TTL WED"], row["PC TTL THU"], row["PC TTL FRI"],
-            row["Totals"]
-        ])
+        try:
+            wb.remove(wb["DEBUG"])
+        except Exception:
+            pass
 
     bio = io.BytesIO()
     wb.save(bio)
