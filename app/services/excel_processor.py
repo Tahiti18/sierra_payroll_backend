@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.utils import get_column_letter
 
-# ---------- Paths ----------
+# ---------- Paths ---------
 HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = HERE.parent.parent
 REPO_ROOT = PROJECT_ROOT.parent
